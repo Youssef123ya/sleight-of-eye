@@ -7,16 +7,20 @@
 
 import { iwsdkDev } from '@iwsdk/vite-plugin-dev';
 import { defineConfig } from 'vite';
+import { captureSink } from './capture/vite-capture-sink';
 
 // scripts/dev-local.mjs sets APP_LOCAL_DEV=1: plain HTTP on 127.0.0.1 (a secure
 // context, so WebXR + IWER work) without the CLI-managed Playwright browser.
+// APP_PORT lets parallel worktrees run their own dev servers side by side.
 const localDev = process.env.APP_LOCAL_DEV === '1';
+const port = Number(process.env.APP_PORT ?? 8081);
 
 export default defineConfig({
-  plugins: [iwsdkDev(localDev ? { https: false } : {})],
+  // captureSink is serve-only: it receives in-page recordings into captures/.
+  plugins: [iwsdkDev(localDev ? { https: false } : {}), captureSink()],
   server: localDev
-    ? { host: '127.0.0.1', port: 8081, strictPort: true, open: false }
-    : { host: '0.0.0.0', port: 8081, open: false },
+    ? { host: '127.0.0.1', port, strictPort: true, open: false }
+    : { host: '0.0.0.0', port, open: false },
   build: {
     outDir: 'dist',
     sourcemap: process.env.NODE_ENV !== 'production',
@@ -43,6 +47,8 @@ export default defineConfig({
       '@pmndrs/uikit-horizon',
       '@pmndrs/uikit-lucide',
       '@drawcall/uikitml',
+      // pre-bundled so the first page load never triggers a re-optimize reload (src/art/geometry.ts)
+      'three/examples/jsm/utils/BufferGeometryUtils.js',
     ],
     esbuildOptions: { target: 'esnext' },
   },
