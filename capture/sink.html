@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>capture sink</title>
+<!-- Dev-only helper: another window posts { name, buf } here (window.postMessage) and this same-origin page writes it
+     to app/captures/<name> through the dev server's /__capture endpoint (capture/vite-capture-sink.ts). Used to save
+     media from pages whose downloads the in-app browser pane does not persist (e.g. the ElevenLabs narration). -->
+<body style="font: 14px monospace; white-space: pre">
+<script>
+  document.body.textContent = 'sink ready\n';
+  window.addEventListener('message', async (e) => {
+    const { name, buf } = e.data || {};
+    if (typeof name !== 'string' || !(buf instanceof ArrayBuffer)) return;
+    const q = encodeURIComponent(name);
+    try {
+      await fetch(`/__capture/open?name=${q}`, { method: 'POST' });
+      await fetch(`/__capture/append?name=${q}`, { method: 'POST', body: buf });
+      const r = await fetch(`/__capture/close?name=${q}`, { method: 'POST' });
+      const path = await r.text();
+      document.body.textContent += `saved ${name} (${buf.byteLength} bytes) -> ${path}\n`;
+      e.source?.postMessage({ saved: name, bytes: buf.byteLength, path }, '*');
+    } catch (err) {
+      document.body.textContent += `FAILED ${name}: ${err}\n`;
+      e.source?.postMessage({ failed: name, error: String(err) }, '*');
+    }
+  });
+</script>
+</body>
