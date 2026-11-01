@@ -25,6 +25,7 @@ import { clamp01, hash01 } from './math.js';
 import type { Holder, PropController, PropSnapshot } from './props.js';
 import type { GazeTargetRegistryImpl, PokeRegistryImpl } from './registries.js';
 import type { SeenTester } from './seen.js';
+import { refreshWorld, rigFrame, worldPos, worldPosNow, type RigFrame } from './space.js';
 
 export type Phase = 'idle' | 'transition' | 'active' | 'prep' | 'ready' | 'resolving' | 'caught' | 'done';
 
@@ -35,8 +36,18 @@ const BASE_DURATION: Record<GadgetId, number> = {
   firework: CFG.bangLookDuration,
 };
 const LOOKBACK_HOLD = 0.35;
+/**
+ * Rig-local height for flat sight cones: the café's velvet mat is 6 mm thick (props stand on its top, at the
+ * L.propMarks height) while the puppets draw their cone at L.tableY + 4.5 mm, which hid it under the velvet
+ * exactly where it matters. Lifted to just above the mat top (still below every prop's body).
+ */
+const MAT_TOP = L.propMarks.coin[1];
+const CONE_Y = MAT_TOP + 0.0012;
 const QUICK_REVEAL_S = 3.0;
 const ANCHORS: SpectatorAnchor[] = ['eyes', 'head', 'ear', 'hand', 'notebook', 'beak', 'hatTop'];
+/** fx/sfx options used from per-frame code (constants: nothing allocated per call). */
+const EAR_SPARKLE = { count: 3, scale: 0.6 } as const;
+const TINK_OPTS = { at: new Vector3(), volume: 0.35, pitch: 1.4 };
 
 export interface RunnerDeps {
   ctx: GameContext;
@@ -107,6 +118,7 @@ export class TrickRunner {
   private readonly audienceScratch: Spectator[] = [];
   private readonly tmp = new Vector3();
   private readonly tmp2 = new Vector3();
+  private readonly frame: RigFrame;
   private readonly gazeMarker: Group;
   private assist = false;
   /** Spectators that hopped onto the mat and have not hopped back yet. */
@@ -116,6 +128,7 @@ export class TrickRunner {
 
   constructor(private readonly d: RunnerDeps) {
     const { ctx } = d;
+    this.frame = rigFrame(ctx.rig);
     // invisible marker the look-back gaze hint drifts to (the mat spot the audience will gasp at)
     this.gazeMarker = new Group();
     this.gazeMarker.name = 'lookback-target';
@@ -134,7 +147,7 @@ export class TrickRunner {
       d.gazeTargets.add({
         id,
         radius: g.gazeRadius || 0.06,
-        getWorldPosition: (out) => g.focus.getWorldPosition(out),
+        getWorldPosition: (out) => worldPos(g.focus, out),
         enabled: () => g.root.visible !== false,
       });
     }
@@ -203,6 +216,8 @@ export class TrickRunner {
   restartShow(): void {
     this.stars[0] = this.stars[1] = this.stars[2] = 0;
     this.caughtTotal = 0;
+    this.reviewShown = false;
+    this.safe(() => this.d.ctx.ui.review(null)); // the paper leaves with the old show
     this.d.hints.forget();
     void this.startAct(1, 0, false);
   }
@@ -214,10 +229,11 @@ export class TrickRunner {
         const r = this.d.ctx.spectatorFactory.create('rabbit', { id: 'rabbit', seed: 7, accent: SPECTATOR_ACCENT.rabbit, scale: 1 });
         r.root.name = 'rabbit';
         this.nameAnchors(r);
-        // the rabbit sits in its top hat at the left corner of the mat, turned a little toward the props
+        // the rabbit sits in its top hat on the cloth left of the mat, turned a little toward the props
         this.d.ctx.rig.root.add(r.root);
-        r.root.position.set(-0.235, L.tableY + 0.002, -0.37);
+        r.root.position.set(-0.235, L.tableY + 0.0005, -0.37);
         r.root.rotation.set(0, 0.5, 0);
+        this.liftCone(r);
         this.rabbit = r;
         this.spectators.set('rabbit', r);
         this.d.ctx.spectators.push(r);
@@ -282,6 +298,7 @@ export class TrickRunner {
     this.stopLoops();
     this.act = n;
     this.actDef = ALL_ACTS[n - 1];
+    if (this.reviewShown) this.safe(() => ui.review(null));
     this.reviewShown = false;
     this.beat = beatIndex;
     if (!instant) {
@@ -321,6 +338,7 @@ export class TrickRunner {
       spec.root.position.set(0, 0, 0);
       spec.root.quaternion.identity();
       spec.root.visible = true;
+      this.liftCone(spec);
       this.safe(() => spec.setFrozen(false));
       if (this.away.has(spec)) this.sendHome(spec, seat);
       else this.safe(() => void spec.react('idle').catch(() => {}));
@@ -337,7 +355,6 @@ export class TrickRunner {
     this.revealClock = -1;
     this.revealChecked = false;
     this.flusterCount = 0;
-    this.safe(() => cafe.setLamp(1));
     // a mid-act start (resume / skipTo): replay the state the earlier beats would have left behind
     this.checkpointSnap = null;
     const target = def.beats[beatIndex];
@@ -460,14 +477,13 @@ export class TrickRunner {
       const stars = 1 + (clean ? 1 : 0) + (clean && this.quickReveal ? 1 : 0);
       this.stars[this.act - 1] = stars;
       ctx.events.emit('act:complete', { act: this.act, stars });
-      ctx.rig.toWorld([0, L.tableY + 0.16, -0.45], this.tmp);
       for (let k = 0; k < stars; k++) {
+        // each star keeps its own point (the runner's scratch vectors are reused before these fire)
+        const at = this.frame.toWorld([(k - (stars - 1) / 2) * 0.06, L.tableY + 0.16, -0.45], new Vector3());
         void this.wait(0.35 + 0.3 * k).then(() => {
           if (my !== this.epoch) return;
-          this.safe(() => ctx.audio.sfx('star', { at: this.tmp, pitch: 1 + 0.12 * k }));
-          this.tmp2.copy(this.tmp);
-          this.tmp2.x += (k - (stars - 1) / 2) * 0.06;
-          this.safe(() => ctx.fx.burst('stars', this.tmp2, { count: 6, scale: 0.8 }));
+          this.safe(() => ctx.audio.sfx('star', { at, pitch: 1 + 0.12 * k }));
+          this.safe(() => ctx.fx.burst('stars', at, { count: 6, scale: 0.8 }));
         });
       }
       this.d.onBeatBoundary();
@@ -543,7 +559,8 @@ export class TrickRunner {
     if (this.phase !== 'active') return;
     const g = this.d.gaze;
     const p = g.pointLocal;
-    const [cx, , cz] = L.mat.center;
+    const cx = L.mat.center[0];
+    const cz = L.mat.center[2];
     const onMat =
       g.surface !== 'backdrop' &&
       Math.abs(p.x - cx) <= L.mat.size[0] / 2 + 0.04 &&
@@ -603,7 +620,7 @@ export class TrickRunner {
       const v = this.volunteer;
       id = `${v.id}-ear`;
       const ear = this.anchor(v, 'ear');
-      pos = (out) => ear.getWorldPosition(out);
+      pos = (out) => worldPos(ear, out);
       radius = 0.04;
       this.revealOff.push(
         gazeTargets.add({ id, radius: 0.035, getWorldPosition: pos, enabled: () => this.phase === 'ready' }),
@@ -643,8 +660,12 @@ export class TrickRunner {
     this.sparkleTimer -= dt;
     if (this.sparkleTimer <= 0) {
       this.sparkleTimer = 1.1;
-      this.anchor(this.volunteer, 'ear').getWorldPosition(this.tmp);
-      this.safe(() => this.d.ctx.fx.burst('tick', this.tmp, { count: 3, scale: 0.6 }));
+      worldPos(this.anchor(this.volunteer, 'ear'), this.tmp);
+      try {
+        this.d.ctx.fx.burst('tick', this.tmp, EAR_SPARKLE);
+      } catch (e) {
+        console.warn('[tricks] fx failed', e);
+      }
     }
   }
 
@@ -768,12 +789,13 @@ export class TrickRunner {
           : total >= 5
             ? 'CAFÉ CROWD LEFT GASPING'
             : 'PLUCKY MAGICIAN WINS OVER CRITIC';
+    // Brock's one-liner (the paper adds the quotation mark and his byline)
     const quote =
       total >= 9
-        ? '"I watched every finger. I saw nothing. Remarkable." — Sir Brock'
+        ? 'I watched every finger. I saw nothing. Remarkable.'
         : total >= 6
-          ? '"Hmph. I shall return. With a bigger notebook." — Sir Brock'
-          : '"Adequate. Mostly. Very well — bravo." — Sir Brock';
+          ? 'Hmph. I shall return. With a bigger notebook.'
+          : 'Adequate. Mostly. Very well: bravo.';
     this.later(1.2, my, () => {
       ctx.ui.review({ headline, stars: this.stars.slice(), quote });
       this.reviewShown = true;
@@ -960,7 +982,11 @@ export class TrickRunner {
       if (can && this.d.gaze.targetId === id) p = clamp01(this.d.gaze.dwell / CFG.gadgetDwell);
       if (p !== this.dwellShown[id]) {
         this.dwellShown[id] = p;
-        this.safe(() => g.setDwell(p));
+        try {
+          g.setDwell(p);
+        } catch (e) {
+          console.warn('[tricks] setDwell failed', e);
+        }
       }
       if (can && p >= 1) this.activateGadget(id, g);
     }
@@ -992,7 +1018,7 @@ export class TrickRunner {
     this.safe(() => g.activate());
     this.safe(() => g.setDwell(0));
     this.dwellShown[id] = 0;
-    g.focus.getWorldPosition(this.tmp);
+    worldPos(g.focus, this.tmp);
     this.d.ctx.events.emit('gadget:activated', { gadget: id });
     this.d.hints.progress();
     const at = this.tmp;
@@ -1162,8 +1188,9 @@ export class TrickRunner {
   }
 
   private anyGadgetActive(def: BeatDef): boolean {
-    if (!def.gadgets) return false;
-    for (const id of def.gadgets) if (this.gadgetActive[id]) return true;
+    const list = def.gadgets;
+    if (!list) return false;
+    for (let i = 0; i < list.length; i++) if (this.gadgetActive[list[i]]) return true;
     return false;
   }
 
@@ -1189,8 +1216,12 @@ export class TrickRunner {
       if (this.tinked[k] || s.pinchStrength < 0.55) continue;
       if (this.near(id, s.pinchPoint, (def.kind === 'load' ? CFG.loadRadius : CFG.pinchMagnet) * 1.3)) {
         this.tinked[k] = true;
-        this.d.props.centerWorld(id, this.tmp);
-        this.safe(() => this.d.ctx.audio.sfx('tink', { at: this.tmp, volume: 0.35, pitch: 1.4 }));
+        this.d.props.centerWorld(id, TINK_OPTS.at);
+        try {
+          this.d.ctx.audio.sfx('tink', TINK_OPTS);
+        } catch (e) {
+          console.warn('[tricks] sfx failed', e);
+        }
       }
     }
   }
@@ -1216,10 +1247,11 @@ export class TrickRunner {
     this.nameAnchors(s);
     this.spectators.set(member.id, s);
     ctx.spectators.push(s);
+    const head = this.anchor(s, 'head');
     gazeTargets.add({
       id: s.id,
       radius: s.headRadius || 0.03,
-      getWorldPosition: (out) => this.anchor(s, 'head').getWorldPosition(out),
+      getWorldPosition: (out) => worldPos(head, out),
       enabled: () => s.root.visible && this.lineup.indexOf(s) >= 0,
     });
     return s;
@@ -1251,48 +1283,78 @@ export class TrickRunner {
   private async hopToVolunteer(spec: Spectator): Promise<void> {
     const { cafe } = this.d.ctx;
     const spot = cafe.volunteerSpot;
-    const target = spot.getWorldPosition(new Vector3());
-    const before = spec.root.getWorldPosition(new Vector3());
+    const target = worldPosNow(spot, new Vector3());
+    // the spot is on the velvet mat: land on its top (L.volunteerSpot assumes a thinner mat)
+    this.frame.toLocal(target, this.tmp);
+    if (this.tmp.y < MAT_TOP) {
+      this.tmp.y = MAT_TOP;
+      this.frame.toWorld(this.tmp, target);
+    }
+    const before = worldPosNow(spec.root, new Vector3());
+    const eyesBefore = this.eyesOf(spec, new Vector3());
     this.safe(() => this.d.ctx.audio.sfx('hop', { at: before }));
     // the volunteer faces the magician, ear presented, until it hops back
     this.d.attention.pin(spec.id, 'player');
     this.away.add(spec);
     await this.within(spec.react('hopToVolunteer', { target: target.clone() }), 1.8);
     this.volunteer = spec;
-    this.placeAfterHop(spec, spot, before, target);
+    this.placeAfterHop(spec, spot, before, eyesBefore);
   }
 
   private async hopHome(spec: Spectator): Promise<void> {
     const seatIndex = this.actDef.cast.find((c) => c.id === spec.id)?.seat ?? 0;
     const seat = this.d.ctx.cafe.seats[seatIndex];
     if (!seat) return;
-    const target = seat.getWorldPosition(new Vector3());
-    const before = spec.root.getWorldPosition(new Vector3());
+    const target = worldPosNow(seat, new Vector3());
+    const before = worldPosNow(spec.root, new Vector3());
+    const eyesBefore = this.eyesOf(spec, new Vector3());
     this.safe(() => this.d.ctx.audio.sfx('hop', { at: before }));
     await this.within(spec.react('hopBack', { target: target.clone() }), 1.8);
-    this.placeAfterHop(spec, seat, before, target);
+    this.placeAfterHop(spec, seat, before, eyesBefore);
     this.away.delete(spec);
     this.d.attention.unpin(spec.id);
     if (this.volunteer === spec) this.volunteer = null;
   }
 
   /**
-   * After a hop reaction the spectator must end up parented to its new spot. If the module moved the root,
-   * keep its world pose; if it moved nothing at all, teleport it; if it moved only inner nodes, leave it.
+   * After a hop the spectator must stand at its new spot. A module that moves the root (the stub) is re-parented
+   * there (same world pose); a module that hops an inner node (the puppets: `root` never moves) is left alone;
+   * a module that moved nothing at all is teleported.
    */
-  private placeAfterHop(spec: Spectator, parent: Object3D, before: Vector3, target: Vector3): void {
+  private placeAfterHop(spec: Spectator, parent: Object3D, before: Vector3, eyesBefore: Vector3): void {
     const root = spec.root;
-    const now = root.getWorldPosition(new Vector3());
-    const rootMoved = now.distanceTo(before) > 0.02;
-    const eyes = new Vector3();
-    this.safe(() => spec.getEyeWorldPosition(eyes));
-    const eyesNear = Math.hypot(eyes.x - target.x, eyes.z - target.z) < 0.06;
-    if (rootMoved || !eyesNear) {
+    const rootMoved = worldPosNow(root, this.tmp).distanceTo(before) > 0.02;
+    const eyesMoved = this.eyesOf(spec, this.tmp2).distanceTo(eyesBefore) > 0.02;
+    if (rootMoved || !eyesMoved) {
       parent.add(root);
       root.position.set(0, 0, 0);
       root.quaternion.identity();
     }
   }
+
+  private eyesOf(spec: Spectator, out: Vector3): Vector3 {
+    try {
+      return spec.getEyeWorldPosition(out);
+    } catch {
+      return worldPosNow(spec.root, out);
+    }
+  }
+
+  /** Lift a flat sight cone lying on the tabletop so the 6 mm velvet mat no longer hides it (once per spectator). */
+  private liftCone(s: Spectator): void {
+    if (this.coneLifted.has(s)) return;
+    const cone = s.root.getObjectByName(`${s.id}-cone`);
+    if (!cone || !cone.parent) return;
+    if (!this.frame.rig.root.getObjectById(cone.id)) return; // not on stage yet
+    this.coneLifted.add(s);
+    refreshWorld(cone);
+    this.frame.toLocal(worldPos(cone, this.tmp), this.tmp2);
+    // only a flat cone drawn on the cloth (a cone hanging from the eyes needs nothing)
+    if (Math.abs(this.tmp2.y - L.tableY) > 0.012) return;
+    const dy = CONE_Y - this.tmp2.y;
+    if (dy > 0) cone.position.y += dy;
+  }
+  private readonly coneLifted = new WeakSet<Spectator>();
 
   private seatInstantly(spec: Spectator): void {
     const seatIndex = this.actDef.cast.find((c) => c.id === spec.id)?.seat ?? 0;
@@ -1388,7 +1450,7 @@ export class TrickRunner {
       const m = props.mode(id);
       if (m === 'palmed' || m === 'loaded' || m === 'hidden') props.homeWorld(id, attention.matFocus);
       else props.centerWorld(id, attention.matFocus);
-    } else ctx.rig.toWorld(L.mat.center, attention.matFocus);
+    } else this.frame.toWorld(L.mat.center, attention.matFocus);
   }
 
   private propRoot(id: PropId): Object3D | null {

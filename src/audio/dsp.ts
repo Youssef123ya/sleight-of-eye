@@ -86,7 +86,7 @@ export function envSwell(
   const stop = end ?? r + relTau * 6;
   const e1 = Math.max(r + 0.002, stop - 0.015);
   const fin = Math.max(e1 + MIN_RAMP, stop);
-  const aT = Math.max(0.004, atkTau); // exponential approach: smooth from 0, never a step
+  const aT = Math.max(MIN_RAMP, atkTau); // exponential approach: smooth from 0, never steeper than MIN_RAMP
   p.setValueAtTime(0, t);
   p.setTargetAtTime(peak, t, aT);
   const vr = peak * (1 - Math.exp(-(r - t) / aT));
@@ -168,6 +168,50 @@ export class PopWriter {
   }
 }
 
+/**
+ * Mirrors a chain of setTargetAtTime events on one param (scheduled in time order), so the curve can be continued
+ * analytically and closed on an exact zero with a linear glide instead of a step.
+ */
+export class TargetChain {
+  private t0: number;
+  private v0: number;
+  private target: number;
+  private tau = 1;
+
+  constructor(
+    readonly p: AudioParam,
+    t: number,
+    v = 0,
+  ) {
+    this.t0 = t;
+    this.v0 = v;
+    this.target = v;
+  }
+
+  valueAt(t: number): number {
+    return t <= this.t0 ? this.v0 : this.target + (this.v0 - this.target) * Math.exp(-(t - this.t0) / this.tau);
+  }
+
+  to(target: number, t: number, tau: number): void {
+    const tt = Math.max(t, this.t0);
+    const k = Math.max(MIN_RAMP, tau);
+    this.v0 = this.valueAt(tt);
+    this.t0 = tt;
+    this.target = target;
+    this.tau = k;
+    this.p.setTargetAtTime(target, tt, k);
+  }
+
+  /** Continue the curve to `end - glide`, then glide linearly to exactly 0 at `end`. Returns `end`. */
+  close(end: number, glide = 0.012): number {
+    const e1 = Math.max(this.t0 + 0.001, end - Math.max(MIN_RAMP, glide));
+    const fin = Math.max(e1 + MIN_RAMP, end);
+    this.p.setValueAtTime(this.valueAt(e1), e1);
+    this.p.linearRampToValueAtTime(0, fin);
+    return fin;
+  }
+}
+
 /** Exponential glide from → to (frequencies; both > 0). */
 export function glide(p: AudioParam, t: number, from: number, to: number, dur: number): number {
   p.setValueAtTime(Math.max(1e-3, from), t);
@@ -187,15 +231,17 @@ export function path(p: AudioParam, t: number, values: readonly number[], durs: 
   return tt;
 }
 
-/** Freeze a param at its current value at time t, dropping later automation (cancelAndHold when available). */
+/**
+ * Freeze a param at its current value at `t` (= ctx.currentTime), dropping later automation, so the next ramp or
+ * target starts from exactly here. The explicit setValueAtTime pin is essential: measured in Chrome (offline renders),
+ * cancelAndHoldAtTime alone makes a following linearRamp start from 0 after a running setTarget (a hard cut), and
+ * from the PREVIOUS event otherwise (a jump at t). `p.value` is the param's value at the current render quantum.
+ */
 export function hold(p: AudioParam, t: number): void {
-  if (typeof p.cancelAndHoldAtTime === 'function') {
-    p.cancelAndHoldAtTime(t);
-  } else {
-    const v = p.value;
-    p.cancelScheduledValues(t);
-    p.setValueAtTime(v, t);
-  }
+  const v = p.value;
+  if (typeof p.cancelAndHoldAtTime === 'function') p.cancelAndHoldAtTime(t);
+  else p.cancelScheduledValues(t);
+  p.setValueAtTime(v, t);
 }
 
 // --------------------------------------------------------------------------------------- generated data
@@ -227,19 +273,35 @@ function normalizePeak(d: Float32Array, target: number): void {
   for (let i = 0; i < d.length; i++) d[i] *= k;
 }
 
+/** Remove the mean (dense noise only: a sparse buffer would gain a constant offset instead). */
+function removeMean(d: Float32Array): void {
+  let s = 0;
+  for (let i = 0; i < d.length; i++) s += d[i];
+  const m = s / Math.max(1, d.length);
+  for (let i = 0; i < d.length; i++) d[i] -= m;
+}
+
 export function makeWhite(sr: number, secs: number, seed: number): Float32Array<ArrayBuffer>[] {
   const r = mulberry32(seed);
   const d = new Float32Array(Math.floor(sr * secs));
   for (let i = 0; i < d.length; i++) d[i] = r() * 2 - 1;
+  removeMean(d); // lowpassed recipes (thumps, puffs) pass DC straight through
   return [d];
 }
 
-/** Pink noise (Paul Kellet's refined filter), peak-normalised. */
+/**
+ * Pink noise (Paul Kellet's refined filter), DC-blocked, peak-normalised and a seamless loop (the brushes loop it
+ * for minutes): the tail is equal-power crossfaded into the head, so the seam has no step.
+ */
 export function makePink(sr: number, secs: number, seed: number): Float32Array<ArrayBuffer>[] {
   const r = mulberry32(seed);
-  const d = new Float32Array(Math.floor(sr * secs));
-  let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
-  for (let i = 0; i < d.length; i++) {
+  const n = Math.floor(sr * secs);
+  const xf = Math.floor(0.05 * sr);
+  const warm = Math.floor(0.25 * sr); // let the 1/f poles and the DC blocker settle before recording
+  const tmp = new Float32Array(n + xf);
+  const R = 1 - (2 * Math.PI * 4) / sr; // one-pole DC blocker at ~4 Hz: no slow wander reaches a lowpassed recipe
+  let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0, x1 = 0, y1 = 0;
+  for (let i = -warm; i < tmp.length; i++) {
     const w = r() * 2 - 1;
     b0 = 0.99886 * b0 + w * 0.0555179;
     b1 = 0.99332 * b1 + w * 0.0750759;
@@ -247,9 +309,20 @@ export function makePink(sr: number, secs: number, seed: number): Float32Array<A
     b3 = 0.8665 * b3 + w * 0.3104856;
     b4 = 0.55 * b4 + w * 0.5329522;
     b5 = -0.7616 * b5 - w * 0.016898;
-    d[i] = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362;
+    const p = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362;
     b6 = w * 0.115926;
+    const y = p - x1 + R * y1;
+    x1 = p;
+    y1 = y;
+    if (i >= 0) tmp[i] = y;
   }
+  const d = new Float32Array(n);
+  for (let i = 0; i < n; i++) d[i] = tmp[i];
+  for (let i = 0; i < xf; i++) {
+    const x = (i + 0.5) / xf;
+    d[i] = tmp[i] * Math.sqrt(x) + tmp[n + i] * Math.sqrt(1 - x);
+  }
+  removeMean(d);
   normalizePeak(d, 0.95);
   return [d];
 }
@@ -334,24 +407,33 @@ export function makeFuseLoop(sr: number, secs: number, seed: number): Float32Arr
     const x = i / xf;
     out[i] = tmp[i] * Math.sqrt(x) + tmp[n + i] * Math.sqrt(1 - x);
   }
+  removeMean(out);
   normalizePeak(out, 0.8);
   return [out];
 }
 
-/** Pocket-watch ticking loop: 1 s, four ticks alternating tick / tock. */
+/**
+ * Pocket-watch ticking loop: 1 s, four ticks alternating tick / tock. Every tick follows the engine's envelope rule
+ * (5 ms linear attack, decays no steeper than tau = 5 ms) — crispness comes from the bright ring, not a hard edge.
+ */
 export function makeTickLoop(sr: number, seed: number): Float32Array<ArrayBuffer>[] {
   const r = mulberry32(seed);
   const d = new Float32Array(sr);
+  const atk = MIN_RAMP;
   for (let k = 0; k < 4; k++) {
     const at = Math.floor((0.02 + k * 0.25) * sr);
     const f = k % 2 === 0 ? 4300 : 3500;
-    const len = Math.floor(0.035 * sr);
+    const len = Math.floor(0.09 * sr); // long enough that every partial has decayed below -80 dB (no truncation)
+    let lp = 0;
     for (let j = 0; j < len; j++) {
       const tt = j / sr;
-      const click = (r() * 2 - 1) * Math.exp(-tt / 0.0009);
-      const ring = Math.sin(2 * Math.PI * f * tt) * Math.exp(-tt / 0.004);
-      const body = Math.sin(2 * Math.PI * 1650 * tt) * Math.exp(-tt / 0.006) * 0.35;
-      d[at + j] += (click * 0.5 + ring * 0.8 + body) * Math.min(1, j / 8);
+      const a = Math.min(1, tt / atk); // 5 ms linear attack
+      const dt = Math.max(0, tt - atk);
+      lp += 0.35 * (r() * 2 - 1 - lp); // softened noise: the escapement's scrape
+      const click = lp * Math.exp(-dt / 0.005);
+      const ring = Math.sin(2 * Math.PI * f * tt) * Math.exp(-dt / 0.006);
+      const body = Math.sin(2 * Math.PI * 1650 * tt) * Math.exp(-dt / 0.008) * 0.35;
+      d[at + j] += (click * 0.6 + ring * 0.8 + body) * a;
     }
   }
   normalizePeak(d, 0.7);

@@ -4,9 +4,10 @@
 // the text), so a spectator says the same line the same way every time, like a real voice.
 import type { Mood, SpectatorKind } from '../contracts.js';
 import type { Ev } from './core.js';
-import { clamp, hashString, MIN_RAMP, mulberry32, PopWriter, rnd, semis } from './dsp.js';
+import { clamp, hashString, MIN_RAMP, mulberry32, PopWriter, rnd, semis, TargetChain } from './dsp.js';
 
 export const LETTER_STEP = 0.045;
+const VOICE_ATTACK_MIN = 0.006;
 
 interface VoiceProfile {
   /** Base pitch (Hz): body size. */
@@ -28,8 +29,8 @@ interface VoiceProfile {
 }
 
 const PROFILES: Record<SpectatorKind, VoiceProfile> = {
-  fox: { f0: 520, fmt: 1.3, src: 'saw', lp: 6200, chirp: 0, round: 0, level: 1.1, attack: 0.005, legato: 0.14 },
-  magpie: { f0: 780, fmt: 1.48, src: 'pulse', lp: 8000, chirp: 4.5, round: 0, level: 0.85, attack: 0.004, legato: 0.06 },
+  fox: { f0: 520, fmt: 1.3, src: 'saw', lp: 6200, chirp: 0, round: 0, level: 1.1, attack: 0.006, legato: 0.14 },
+  magpie: { f0: 780, fmt: 1.48, src: 'pulse', lp: 8000, chirp: 4.5, round: 0, level: 0.85, attack: 0.006, legato: 0.06 },
   badger: { f0: 138, fmt: 0.9, src: 'saw', lp: 2300, chirp: 0, round: 0.45, level: 1.3, attack: 0.008, legato: 0.24 },
   rabbit: { f0: 350, fmt: 1.16, src: 'reed', lp: 5200, chirp: 0, round: 0.1, level: 0.4, attack: 0.006, legato: 0.12 },
 };
@@ -166,10 +167,11 @@ export function speak(ev: Ev, text: string, kind: SpectatorKind, mood: Mood | un
   const nbp = ev.filter('bandpass', 3000, 1.6, nEnv);
   ev.noise('white', t0, end + 0.01, nbp);
   const clicks = new PopWriter(nEnv.gain, MIN_RAMP, 0.01);
+  const amp = new TargetChain(env.gain, t0, 0); // letter envelope (setTarget chain, closed on an exact zero)
   if (mood === 'flustered') ev.osc('sine', rnd(r, 7.5, 9.5), t0, end + 0.01, ev.gain(55, osc.detune));
 
   // ---- pass 2: per-letter automation
-  const level = 0.5 * prof.level * MOOD_LEVEL[mood ?? 'neutral'];
+  const level = 0.5 * prof.level * (MOOD_LEVEL[mood ?? 'neutral'] ?? MOOD_LEVEL.neutral); // unknown mood → neutral
   const blipLen = LETTER_STEP * (mood === 'accusing' ? 0.5 : 0.68);
   const floor = mood === 'accusing' ? 0 : mood === 'happy' ? 0.05 : prof.legato;
   let k = 0;
@@ -178,7 +180,7 @@ export function speak(ev: Ev, text: string, kind: SpectatorKind, mood: Mood | un
     const ch = s[i];
     const ti = times[i];
     if (!isLetter(ch)) {
-      env.gain.setTargetAtTime(0, ti, 0.01);
+      amp.to(0, ti, 0.01);
       continue;
     }
     const lower = ch.toLowerCase();
@@ -218,8 +220,10 @@ export function speak(ev: Ev, text: string, kind: SpectatorKind, mood: Mood | un
     f2.frequency.setTargetAtTime(ev.safe(F2 * prof.fmt), ti, 0.008);
     // envelope: one blip per letter
     const lvl = level * CLASS_LEVEL[info.cls] * (shout ? 1.2 : 1) * accent;
-    env.gain.setTargetAtTime(lvl, ti, prof.attack);
-    env.gain.setTargetAtTime(lvl * floor, ti + blipLen, 0.008);
+    // exponential attack: tau 6 ms keeps the steepest slope gentler than a 5 ms linear ramp even though a short blip
+    // never quite reaches its target
+    amp.to(lvl, ti, Math.max(VOICE_ATTACK_MIN, prof.attack));
+    amp.to(lvl * floor, ti + blipLen, 0.008);
     // consonant noise
     if (info.cls === 'plosive' || info.cls === 'fricative') {
       nbp.frequency.setValueAtTime(ev.safe(info.noiseHz * Math.sqrt(prof.fmt)), ti);
@@ -227,8 +231,8 @@ export function speak(ev: Ev, text: string, kind: SpectatorKind, mood: Mood | un
     }
     k++;
   }
-  env.gain.setTargetAtTime(0, tLast, 0.012);
-  env.gain.setValueAtTime(0, end - 0.004); // ~e^-8 below the last letter: an inaudible step to true zero
+  amp.to(0, tLast, 0.012);
+  amp.close(end, 0.012); // continue the decay analytically, then a 12 ms linear glide to exactly zero (no step)
   clicks.close();
   return end;
 }

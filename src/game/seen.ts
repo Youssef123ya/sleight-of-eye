@@ -5,7 +5,10 @@
 import { Vector3, type Signal } from '@iwsdk/core';
 import { CFG } from '../config.js';
 import type { Cafe, PropId, Settings, Spectator } from '../contracts.js';
-import { DEG, angleBetween } from './math.js';
+import { DEG, angleBetween, angleTo } from './math.js';
+import { worldPosNow } from './space.js';
+
+const NO_PROPS: readonly PropId[] = [];
 
 export interface SeenResult {
   by: Spectator;
@@ -36,7 +39,7 @@ export class SeenTester {
   seen(
     point: Vector3,
     audience: readonly Spectator[],
-    exclude: readonly PropId[] = [],
+    exclude: readonly PropId[] = NO_PROPS,
     blind?: (s: Spectator) => boolean,
   ): SeenResult | null {
     const half = this.halfAngleDeg() * DEG;
@@ -69,8 +72,13 @@ export class SeenTester {
     } catch {
       return false;
     }
-    this.to.copy(point).sub(this.eye);
-    return angleBetween(this.dir, this.to) <= (this.halfAngleDeg() + marginDeg) * DEG;
+    return this.watchingFrom(this.eye, this.dir, point, marginDeg);
+  }
+
+  /** Same test from an eye position + look direction the caller already has (per-frame, allocation-free). */
+  watchingFrom(eye: Vector3, dir: Vector3, point: Vector3, marginDeg = 4): boolean {
+    const a = angleTo(dir, point.x - eye.x, point.y - eye.y, point.z - eye.z);
+    return a <= (this.halfAngleDeg() + marginDeg) * DEG;
   }
 
   /** Degrees between a spectator's look direction and the direction to `point`. */
@@ -91,7 +99,7 @@ export class SeenTester {
       const p = props[id as PropId];
       if (!p || !p.cover || exclude.indexOf(p.id) >= 0) continue;
       if (!p.root.visible) continue;
-      p.root.getWorldPosition(this.c);
+      worldPosNow(p.root, this.c);
       const r = Math.max(0.015, p.radius || 0.03);
       this.c.y += r * 0.6; // centre of the cover body (props stand on their origin)
       // the cover must stand over the point …

@@ -9,7 +9,7 @@
 //   tense   — D minor, 86 BPM, two-feel bass, sparse low piano, swishes only, darker
 //   triumph — a resolving ii–V–I cadence (rolled F6/9) and then a brighter, fuller F major loop at 98 BPM
 import type { AudioCore, Ev, Track } from './core.js';
-import { NodeBag, warnOnce } from './core.js';
+import { LEAD, NodeBag, warnOnce } from './core.js';
 import { clamp, envAD, envNote, hold, midiHz, MIN_RAMP, pick, PopWriter, semis, type Rng } from './dsp.js';
 
 export type MusicMood = 'calm' | 'tense' | 'triumph';
@@ -343,7 +343,9 @@ class MusicSession {
   pump(until: number): void {
     if (!this.playing) return;
     const now = this.core.ctx.currentTime;
-    if (this.beatT < now - 0.05) this.beatT = now + 0.02; // main thread stalled: re-align instead of bursting
+    // Main thread stalled past the next beat (or the tab slept): slide the grid. Scheduling into the past would
+    // start notes mid-envelope (the attack collapses into a click) and burst the whole backlog at once.
+    if (this.beatT < now + LEAD * 0.5) this.beatT = now + LEAD;
     let guard = 0;
     while (this.beatT < until && guard++ < 8) {
       this.beat(this.beatT);
@@ -645,6 +647,9 @@ export class MusicBoxTrack implements Track {
   readonly duration: number;
   private readonly events: MbEvent[] = [];
   private idx = 0;
+  /** Seconds the remaining timeline has slid after main-thread stalls. */
+  private slip = 0;
+  private released = false;
   private readonly serial: number;
 
   constructor(
@@ -691,31 +696,44 @@ export class MusicBoxTrack implements Track {
 
   pump(until: number): boolean {
     if (this.ev.bag.done || this.ev.bag.serial !== this.serial) return true; // the voice was stolen
-    while (this.idx < this.events.length && this.events[this.idx].t < until) {
+    if (this.idx < this.events.length) {
+      const now = this.ev.ctx.currentTime;
+      const next = this.events[this.idx].t + this.slip;
+      // main thread stalled: the box hesitates like a sticky comb instead of starting tines mid-envelope
+      if (next < now + LEAD * 0.5) this.slip += now + LEAD - next;
+    }
+    while (this.idx < this.events.length && this.events[this.idx].t + this.slip < until) {
       const e = this.events[this.idx++];
-      this.tine(e);
+      this.tine(e, e.t + this.slip);
     }
     if (this.idx >= this.events.length) {
+      this.released = true;
       this.ev.bag.unhold();
       return true;
     }
     return false;
   }
 
+  abort(): void {
+    if (this.released || this.ev.bag.done || this.ev.bag.serial !== this.serial) return;
+    this.released = true;
+    this.ev.bag.unhold(); // the voice ends when the tines already scheduled have rung out
+  }
+
   /** A comb tine: bright sine with a fast-decaying inharmonic overtone (the "tink" of the pin). */
-  private tine(e: MbEvent): void {
+  private tine(e: MbEvent, t: number): void {
     const ev = this.ev;
     const f = ev.hz(midiHz(e.midi));
     const g = ev.gain(0, ev.out);
-    const e1 = envAD(g.gain, e.t, e.amp, MIN_RAMP, e.melody ? 0.42 : 0.3, e.t + (e.melody ? 2.4 : 1.7));
-    ev.osc('sine', f, e.t, e1 + 0.01, g);
+    const e1 = envAD(g.gain, t, e.amp, MIN_RAMP, e.melody ? 0.42 : 0.3, t + (e.melody ? 2.4 : 1.7));
+    ev.osc('sine', f, t, e1 + 0.01, g);
     if (e.melody) {
       const g2 = ev.gain(0, ev.out);
-      const e2 = envAD(g2.gain, e.t, e.amp * 0.28, MIN_RAMP, 0.03, e.t + 0.25);
-      ev.osc('sine', ev.safe(f * 6.27), e.t, e2 + 0.01, g2);
+      const e2 = envAD(g2.gain, t, e.amp * 0.28, MIN_RAMP, 0.03, t + 0.25);
+      ev.osc('sine', ev.safe(f * 6.27), t, e2 + 0.01, g2);
       const g3 = ev.gain(0, ev.out);
-      const e3 = envAD(g3.gain, e.t, e.amp * 0.12, MIN_RAMP, 0.12, e.t + 0.9);
-      ev.osc('sine', ev.safe(f * 2), e.t, e3 + 0.01, g3);
+      const e3 = envAD(g3.gain, t, e.amp * 0.12, MIN_RAMP, 0.12, t + 0.9);
+      ev.osc('sine', ev.safe(f * 2), t, e3 + 0.01, g3);
     }
   }
 }

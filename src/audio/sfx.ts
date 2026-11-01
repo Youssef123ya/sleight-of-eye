@@ -184,10 +184,10 @@ function bang(ev: Ev): number {
   ev.noise('white', t, e3 + 0.01, bp);
   const gc = ev.gain(0, ev.out);
   const hp = ev.filter('highpass', 3200, 0.7, gc);
-  const pw = new PopWriter(gc.gain, MIN_RAMP, 0.005);
+  const pw = new PopWriter(gc.gain, MIN_RAMP, 0.006);
   for (let tc = t + 0.22; tc < t + 2.3; ) {
     const u = (tc - t) / 2.3;
-    pw.pop(tc, rnd(r, 0.2, 0.7) * (1 - u) * (1 - u), rnd(r, 0.003, 0.008));
+    pw.pop(tc, rnd(r, 0.2, 0.7) * (1 - u) * (1 - u), rnd(r, MIN_RAMP, 0.009)); // no decay steeper than 5 ms
     tc += rnd(r, 0.025, 0.12) * (1 + u * 1.5);
   }
   const e4 = pw.close();

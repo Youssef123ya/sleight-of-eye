@@ -6,9 +6,9 @@
 //        --scenario=tests/scenarios/core-act2.mjs --out=tests/out/core-act2.png
 import { makeHelpers } from './core-lib.mjs';
 
-export default async function act2(page, api) {
-  const h = makeHelpers(page, api);
-  const { note, waitFor, check, look, turnTo, reach, pinch, poke, where, state, events, add, failures, timeline } = h;
+/** Act II from its rule demo to the Act III curtain (`skip`: jump there with skipTo first). Throws on a timeout. */
+export async function playAct2(h, { skip = true } = {}) {
+  const { page, api, waitFor, check, look, turnTo, reach, pinch, poke, where, state, events, add } = h;
   const magpieLooksAt = async (pt) => {
     const s = await state();
     const m = s.spectators.find((x) => x.id === 'magpie');
@@ -19,10 +19,12 @@ export default async function act2(page, api) {
     const dot = (d[0] * m.look[0] + d[1] * m.look[1] + d[2] * m.look[2]) / len;
     return (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
   };
-  try {
-    await waitFor((s) => s.calibrated && s.started, 30000, 'show started');
-    await page.evaluate(() => window.__app.skipTo(2, 0));
-    await waitFor((s) => s.act === 2 && s.beatKind === 'demo' && s.phase === 'active', 5000, 'Act II rule demo');
+  {
+    if (skip) {
+      await waitFor((s) => s.calibrated && s.started, 30000, 'show started');
+      await page.evaluate(() => window.__app.skipTo(2, 0));
+    }
+    await waitFor((s) => s.act === 2 && s.beatKind === 'demo' && s.phase === 'active', skip ? 5000 : 15000, 'Act II rule demo');
     const ball = await where('ball');
     // look far left: kits follow, the magpie keeps staring at the ball
     await turnTo([0, 0.9, -0.45], [-0.3, 0.92, -0.5], 0.5);
@@ -72,7 +74,7 @@ export default async function act2(page, api) {
     await reach(grab, loadAt, 0.5, 0);
     await pinch(1, 0.3);
     s = await waitFor((x) => x.beatKind === 'lookBack', 2000, 'ball loaded under the right cup');
-    check(s.loaded === 'ball->cupRight' && s.caught === 1, 'loaded unseen', { loaded: s.loaded, caught: s.caught });
+    check(s.loaded?.ball === 'cupRight' && s.caught === 1, 'loaded unseen', { loaded: s.loaded, caught: s.caught });
     await pinch(0, 0.2);
     await reach(loadAt, add(loadAt, [0.1, 0.05, 0.15]), 0.4, 0);
 
@@ -94,6 +96,14 @@ export default async function act2(page, api) {
       { kinds },
     );
     await waitFor((x) => x.act === 3, 12000, 'curtain → Act III');
+  }
+}
+
+export default async function act2(page, api) {
+  const h = makeHelpers(page, api);
+  const { note, failures, timeline } = h;
+  try {
+    await playAct2(h, { skip: true });
   } catch (e) {
     if (!failures.includes(String(e?.message ?? e))) failures.push(String(e?.message ?? e));
   }

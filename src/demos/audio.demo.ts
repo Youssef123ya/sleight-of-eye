@@ -7,11 +7,14 @@
 //                      end ONE console.warn line "[audio-tour] {json}" reports the master-meter peak of every step.
 //   &fast=1 / &fast=2  shorter tour (0.45x / 0.25x pacing, QA)
 //   &render=1          OFFLINE VERIFICATION: every sound + music excerpts are rendered through an
-//                      OfflineAudioContext running the same synth graph (src/audio/offline.ts) and measured.
-//                      Results: DOM <pre id="audio-report">, document.title, the in-world report board, and ONE
-//                      console.warn line "[audio-report] {json}" — tests/shot.mjs prints console warnings in its
-//                      JSON output, so `node tests/shot.mjs --url=...?demo=audio&render=1 --wait=20000` captures
-//                      both the numbers and a screenshot of the report.
+//                      OfflineAudioContext running the same synth graph (src/audio/offline.ts) and measured: peak,
+//                      RMS, NaN, DC offset, loudness (50 ms + K-weighted LUFS), dry onset/ending, an audit of EVERY
+//                      gain envelope (ramps >= 5 ms, no steps, nothing scheduled into the past), spatial imaging,
+//                      scheduler stalls, bad inputs, voice-cap stress. Results: DOM <pre id="audio-report">,
+//                      document.title, the in-world report board, and ONE console.warn line
+//                      "[audio-report] {json}" — tests/shot.mjs prints console warnings in its JSON output, so
+//                      `node tests/shot.mjs --url=...?demo=audio&render=1 --wait=30000` captures both.
+//   window.__audio     debug view of the live engine (state, voices, panners, stats, meter, listener owner, engine)
 //   &ui=0              hide the DOM panel (clean screenshots)
 import {
   BoxGeometry,
@@ -35,7 +38,7 @@ import { mergeParts } from '../art/geometry.js';
 import { feltMaterial, matcapMaterial } from '../art/matcap.js';
 import { PAL } from '../art/palette.js';
 import { audioDebug, createAudioEngine, type AudioMeter } from '../audio/engine.js';
-import { renderAudioReport, type AudioReportEntry } from '../audio/offline.js';
+import { balanceOf, LIMITS, renderAudioReport, type AudioBalance, type AudioReportEntry } from '../audio/offline.js';
 import { onUpdate } from '../boot/loop.js';
 import type { CrowdKind, Mood, SfxName, SpectatorKind } from '../contracts.js';
 import { L, StageRig, type V3 } from '../layout.js';
@@ -327,12 +330,14 @@ export default async function audioDemo(world: World): Promise<void> {
   const panel = document.createElement('div');
   panel.id = 'audio-ui';
   panel.style.cssText =
-    'position:fixed;right:8px;top:8px;width:452px;max-height:calc(100vh - 16px);overflow:hidden;z-index:2147483647;' +
-    'font:10px/1.2 ui-monospace,Consolas,Menlo,monospace;color:#fff4dc;background:rgba(18,13,28,.88);' +
+    `position:fixed;right:8px;top:8px;width:${wantRender ? 600 : 452}px;max-width:calc(100vw - 16px);` +
+    'max-height:calc(100vh - 16px);overflow:hidden;z-index:2147483647;' +
+    `font:${wantRender ? '9.5px/1.17' : '10px/1.2'} ui-monospace,Consolas,Menlo,monospace;color:#fff4dc;background:rgba(18,13,28,.9);` +
     'border:1px solid #c99a3c;border-radius:10px;padding:10px 12px;box-sizing:border-box;' +
     (showUi ? '' : 'display:none;');
   const button = document.createElement('button');
-  button.textContent = '▶ Play the sound tour (click or Enter)';
+  // (render mode avoids the word "enter": the QA harness clicks Enter buttons, and the tour would run alongside)
+  button.textContent = wantRender ? '▶ Play the sound tour' : '▶ Play the sound tour (click or Enter)';
   button.style.cssText =
     'font:600 13px system-ui,sans-serif;color:#241a12;background:#ffcf5a;border:0;border-radius:8px;padding:8px 12px;cursor:pointer;width:100%';
   const status = document.createElement('div');
@@ -533,6 +538,9 @@ function fmt(v: number, d = 3): string {
   return v.toFixed(d);
 }
 
+const ms = (v: number): string => (Number.isFinite(v) ? v.toFixed(1) : '—').padStart(5);
+const db = (v: number): string => (v > 0 ? (20 * Math.log10(v)).toFixed(0) : '-inf').padStart(5);
+
 async function runReport(
   pre: HTMLPreElement,
   rep: { ctx: CanvasRenderingContext2D; commit: () => void },
@@ -547,32 +555,34 @@ async function runReport(
     pre.textContent = `OFFLINE RENDER  ${i + 1}/${n}\n${head}\n${rows.join('\n')}`;
     document.title = `audio report ${i + 1}/${n}`;
   });
-  const ms = Math.round(performance.now() - t0);
+  const took = Math.round(performance.now() - t0);
   const pass = entries.filter((e) => e.ok).length;
-  const avg = (prefix: string): number => {
-    const xs = entries.filter((e) => e.name.startsWith(prefix)).map((e) => e.loud);
-    return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : NaN;
-  };
-  const balance = {
-    music: avg('music:calm 6s'),
-    voices: avg('say:'),
-    foley: (avg('sfx:tink') + avg('sfx:fwip') + avg('sfx:shh') + avg('sfx:poof') + avg('sfx:cupThunk')) / 5,
-    crowd: avg('crowd:'),
-    ui: avg('sfx:uiHover'),
-    pad: avg('pad:'),
-  };
+  const bal = balanceOf(entries);
   const maxPeak = Math.max(...entries.map((e) => e.peak));
-  const ok = pass === entries.length && !entries.some((e) => e.nan) && maxPeak < 0.99;
-  const balanceLine = Object.entries(balance)
-    .map(([k, v]) => `${k} ${v.toFixed(1)}`)
-    .join(' · ');
+  const maxDc = Math.max(...entries.map((e) => e.dc));
+  const minAtk = Math.min(...entries.map((e) => e.atk));
+  const minRel = Math.min(...entries.map((e) => e.rel));
+  const maxJump = Math.max(...entries.map((e) => e.jump));
+  const late = entries.reduce((a, e) => a + e.late, 0);
+  const ok = pass === entries.length && !entries.some((e) => e.nan) && maxPeak < LIMITS.peak && bal.ok;
+  const cats = Object.keys(bal.loud);
+  const balanceLines =
+    `balance (loudest 50 ms dBFS / momentary LUFS): ` +
+    cats.map((k) => `${k} ${bal.loud[k].toFixed(1)}/${bal.lufs[k].toFixed(1)}`).join(' · ') +
+    `\nmusic bed ${bal.musicLufsI.toFixed(1)} LUFS · music under foley ${bal.underFoley.toFixed(1)} dB (${bal.underFoleyLufs.toFixed(1)} LUFS-M)` +
+    ` · under voices ${bal.underVoices.toFixed(1)} dB (${bal.underVoicesLufs.toFixed(1)} LUFS-M) ${bal.ok ? '✓' : '✗'}`;
+  const notes = entries.filter((e) => e.note).map((e) => `${e.ok ? '·' : '✗'} ${e.name}: ${e.note}`);
+  // summary + balance first: a screenshot of the panel always shows them
   pre.textContent =
-    `OFFLINE RENDER REPORT  ${pass}/${entries.length} ok · max peak ${fmt(maxPeak)} · ${ms} ms\n` +
-    `${head}\n${rows.join('\n')}\n` +
-    `loudest-50ms dBFS: ${balanceLine}`;
+    `OFFLINE RENDER REPORT  ${pass}/${entries.length} ok · max peak ${fmt(maxPeak)} · max |DC| ${maxDc.toExponential(1)} · ` +
+    `steepest ramp ${minAtk.toFixed(1)}/${minRel.toFixed(1)} ms · max step ${maxJump.toExponential(1)} · late ${late} · ${took} ms\n` +
+    `${balanceLines}\n${head}\n${rows.join('\n')}\n${notes.join('\n')}`;
   document.title = `${ok ? 'AUDIO OK' : 'AUDIO FAIL'} ${pass}/${entries.length} max ${fmt(maxPeak)}`;
-  drawReportBoard(rep, entries, pass, maxPeak, balance);
-  drawNow(ok ? '✔ Offline audio report: all clear' : '✖ Offline audio report: issues', `${pass}/${entries.length} renders ok · max peak ${fmt(maxPeak)} · ${ms} ms`);
+  drawReportBoard(rep, entries, pass, maxPeak, bal);
+  drawNow(
+    ok ? '✔ Offline audio report: all clear' : '✖ Offline audio report: issues',
+    `${pass}/${entries.length} renders ok · max peak ${fmt(maxPeak)} · ramps ≥ ${Math.min(minAtk, minRel).toFixed(1)} ms · ${took} ms`,
+  );
   const compact = entries.map((e) => ({
     name: e.name,
     peak: +fmt(e.peak, 4),
@@ -580,6 +590,16 @@ async function runReport(
     nan: e.nan,
     raw: +fmt(e.raw, 3),
     loud: +e.loud.toFixed(1),
+    lufs: +e.lufs.toFixed(1),
+    lufsI: +e.lufsI.toFixed(1),
+    dc: +e.dc.toExponential(2),
+    atk: Number.isFinite(e.atk) ? +e.atk.toFixed(2) : null,
+    rel: Number.isFinite(e.rel) ? +e.rel.toFixed(2) : null,
+    jump: +e.jump.toExponential(2),
+    late: e.late,
+    onset: +e.onset.toFixed(3),
+    end: +e.end.toExponential(2),
+    params: e.params,
     dur: +e.dur.toFixed(2),
     act: +e.act.toFixed(2),
     hf: +e.hf.toFixed(1),
@@ -587,14 +607,29 @@ async function runReport(
     ok: e.ok,
     ...(e.note ? { note: e.note } : {}),
   }));
-  console.warn(`[audio-report] ${JSON.stringify({ ok, pass, total: entries.length, maxPeak: +fmt(maxPeak, 4), ms, balance, entries: compact })}`);
+  const r1 = (v: number): number => +v.toFixed(1);
+  const balance = {
+    loud: Object.fromEntries(cats.map((k) => [k, r1(bal.loud[k])])),
+    lufs: Object.fromEntries(cats.map((k) => [k, r1(bal.lufs[k])])),
+    musicLufsI: r1(bal.musicLufsI),
+    underFoley: r1(bal.underFoley),
+    underVoices: r1(bal.underVoices),
+    underFoleyLufs: r1(bal.underFoleyLufs),
+    underVoicesLufs: r1(bal.underVoicesLufs),
+    ok: bal.ok,
+  };
+  const summary = { maxPeak: +fmt(maxPeak, 4), maxDc: +maxDc.toExponential(2), minAttackMs: r1(minAtk), minReleaseMs: r1(minRel), maxStep: +maxJump.toExponential(2), late };
+  console.warn(`[audio-report] ${JSON.stringify({ ok, pass, total: entries.length, ms: took, limits: LIMITS, summary, balance, entries: compact })}`);
 }
 
-const REPORT_HEAD = 'name                                peak  rms    loud  raw  ok';
+const REPORT_HEAD = 'name                              peak  loud  LUFS   DCdB  atk   rel  onset ok';
 
 function row(e: AudioReportEntry): string {
-  const name = e.name.length > 34 ? `${e.name.slice(0, 33)}…` : e.name.padEnd(34);
-  return `${name}  ${fmt(e.peak, 2)}  ${fmt(e.rms, 4)} ${e.loud.toFixed(1).padStart(5)}  ${fmt(e.raw, 2)} ${e.ok ? '✓' : '✗ ' + (e.note ?? '')}`;
+  const name = e.name.length > 32 ? `${e.name.slice(0, 31)}…` : e.name.padEnd(32);
+  return (
+    `${name} ${fmt(e.peak, 2)} ${e.loud.toFixed(1).padStart(5)} ${e.lufs.toFixed(1).padStart(5)} ${db(e.dc)} ` +
+    `${ms(e.atk)} ${ms(e.rel)}  ${fmt(e.onset, 2)} ${e.ok ? '✓' : '✗'}`
+  );
 }
 
 function drawReportBoard(
@@ -602,7 +637,7 @@ function drawReportBoard(
   entries: AudioReportEntry[],
   pass: number,
   maxPeak: number,
-  balance: Record<string, number>,
+  bal: AudioBalance,
 ): void {
   const c = rep.ctx;
   c.clearRect(0, 0, 1024, 1024);
@@ -616,20 +651,22 @@ function drawReportBoard(
   c.textAlign = 'left';
   c.textBaseline = 'alphabetic';
   c.fillText(`Audio check ${pass}/${entries.length}`, 40, 84);
-  c.font = '500 30px system-ui, sans-serif';
+  c.font = '500 28px system-ui, sans-serif';
   c.fillStyle = hex(PAL.lampWarm);
-  c.fillText(`max peak ${maxPeak.toFixed(3)} (limit 0.99) · no NaN`, 40, 128);
+  const minRamp = Math.min(...entries.map((e) => Math.min(e.atk, e.rel)));
+  c.fillText(`max peak ${maxPeak.toFixed(3)} (limit 0.99) · no NaN · ramps ≥ ${minRamp.toFixed(1)} ms`, 40, 126);
+  c.fillText(`music sits ${bal.underFoley.toFixed(1)} dB under foley, ${bal.underVoices.toFixed(1)} dB under voices`, 40, 162);
   // balance bars: loudest 50 ms window, dBFS (-60 … 0)
-  const keys = Object.keys(balance);
+  const keys = Object.keys(bal.loud);
   for (let i = 0; i < keys.length; i++) {
-    const y = 180 + i * 46;
-    const v = balance[keys[i]];
+    const y = 196 + i * 44;
+    const v = bal.loud[keys[i]];
     c.fillStyle = hex(PAL.text);
     c.font = '500 28px system-ui, sans-serif';
     c.fillText(keys[i], 40, y + 26);
     c.fillStyle = 'rgba(255,255,255,0.08)';
     c.fillRect(200, y + 4, 640, 28);
-    c.fillStyle = hex(PAL.velvet);
+    c.fillStyle = hex(keys[i] === 'music' ? PAL.windowGlow : PAL.velvet);
     c.fillRect(200, y + 4, Math.max(0, Math.min(640, ((v + 60) / 60) * 640)), 28);
     c.fillStyle = hex(PAL.text);
     c.fillText(`${v.toFixed(1)} dB`, 860, y + 26);

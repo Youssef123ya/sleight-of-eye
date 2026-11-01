@@ -19,11 +19,53 @@ export function damp(current: number, target: number, lambda: number, dt: number
 
 /** Angle in radians between two (not necessarily unit) vectors; 0 for degenerate input. */
 export function angleBetween(a: Vector3, b: Vector3): number {
-  const la = a.length();
-  const lb = b.length();
+  return angleTo(a, b.x, b.y, b.z);
+}
+
+/**
+ * Angle in radians between `a` and the vector (x, y, z); 0 for degenerate input. Plain arithmetic: per-frame code
+ * calls this instead of three's Vector3 helpers, whose property loads IWSDK's synced transforms make megamorphic.
+ */
+export function angleTo(a: Vector3, x: number, y: number, z: number): number {
+  const ax = a.x;
+  const ay = a.y;
+  const az = a.z;
+  const la = Math.sqrt(ax * ax + ay * ay + az * az);
+  const lb = Math.sqrt(x * x + y * y + z * z);
   if (la < 1e-9 || lb < 1e-9) return 0;
-  const c = clamp(a.dot(b) / (la * lb), -1, 1);
-  return Math.acos(c);
+  return Math.acos(clamp((ax * x + ay * y + az * z) / (la * lb), -1, 1));
+}
+
+// Per-frame vector writes. IWSDK's synced transforms make the property accesses inside three's shared Vector3
+// helpers (set, copy, lerp, ...) megamorphic, and a megamorphic double load or store boxes the value. These tiny
+// helpers only ever see plain Vector3s, so they stay monomorphic and allocation-free once optimised.
+export function setV(out: Vector3, x: number, y: number, z: number): Vector3 {
+  out.x = x;
+  out.y = y;
+  out.z = z;
+  return out;
+}
+
+export function copyV(out: Vector3, v: Vector3): Vector3 {
+  out.x = v.x;
+  out.y = v.y;
+  out.z = v.z;
+  return out;
+}
+
+/** out = a + (b - a) * t */
+export function lerpV(out: Vector3, a: Vector3, b: Vector3, t: number): Vector3 {
+  out.x = a.x + (b.x - a.x) * t;
+  out.y = a.y + (b.y - a.y) * t;
+  out.z = a.z + (b.z - a.z) * t;
+  return out;
+}
+
+export function dist2(a: Vector3, b: Vector3): number {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const dz = a.z - b.z;
+  return dx * dx + dy * dy + dz * dz;
 }
 
 export function smoothstep(t: number): number {
@@ -102,8 +144,7 @@ export class OneEuroVec3 {
     this.x[0] = a * v.x + (1 - a) * this.x[0];
     this.x[1] = a * v.y + (1 - a) * this.x[1];
     this.x[2] = a * v.z + (1 - a) * this.x[2];
-    v.set(this.x[0], this.x[1], this.x[2]);
-    return v;
+    return setV(v, this.x[0], this.x[1], this.x[2]);
   }
 }
 
@@ -145,12 +186,13 @@ export class PointHistory {
       const ti = this.data[idx * 4];
       if (ti <= t) {
         if (newer < 0) {
-          out.set(this.data[idx * 4 + 1], this.data[idx * 4 + 2], this.data[idx * 4 + 3]);
+          setV(out, this.data[idx * 4 + 1], this.data[idx * 4 + 2], this.data[idx * 4 + 3]);
           return true;
         }
         const tn = this.data[newer * 4];
         const f = tn > ti ? (t - ti) / (tn - ti) : 0;
-        out.set(
+        setV(
+          out,
           this.data[idx * 4 + 1] + (this.data[newer * 4 + 1] - this.data[idx * 4 + 1]) * f,
           this.data[idx * 4 + 2] + (this.data[newer * 4 + 2] - this.data[idx * 4 + 2]) * f,
           this.data[idx * 4 + 3] + (this.data[newer * 4 + 3] - this.data[idx * 4 + 3]) * f,
@@ -161,7 +203,7 @@ export class PointHistory {
     }
     // older than everything we have: use the oldest
     const oldest = (this.head - this.count + this.capacity) % this.capacity;
-    out.set(this.data[oldest * 4 + 1], this.data[oldest * 4 + 2], this.data[oldest * 4 + 3]);
+    setV(out, this.data[oldest * 4 + 1], this.data[oldest * 4 + 2], this.data[oldest * 4 + 3]);
     return true;
   }
 }

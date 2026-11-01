@@ -5,8 +5,18 @@ import { CFG } from '../config.js';
 import type { GameEvents, GazeState, GazeTarget, UI } from '../contracts.js';
 import type { Emitter } from '../events.js';
 import { L, type StageRig } from '../layout.js';
-import { DEG, OneEuroVec3, RAD, angleBetween } from './math.js';
+import { DEG, OneEuroVec3, RAD, angleBetween, angleTo, copyV, dist2, setV } from './math.js';
 import type { GazeTargetRegistryImpl } from './registries.js';
+import { rigFrame, worldPos, worldQuat, type RigFrame } from './space.js';
+
+/** Targets farther than this from the gaze ray re-read their centre only every GAZE_REFRESH frames. */
+const GAZE_NEAR_COS = Math.cos(25 * DEG);
+const GAZE_REFRESH = 8;
+
+interface TargetCache {
+  readonly pos: Vector3;
+  age: number;
+}
 
 /** Dwell thresholds that emit 'gaze:dwell' (sorted, unique). */
 const DWELL_MARKS: number[] = [...new Set([CFG.gadgetDwell, CFG.eyeContactFox, CFG.eyeContactCritic])].sort(
@@ -27,9 +37,8 @@ export class GazeTracker implements GazeState {
   surface: GazeSurface = 'table';
   /** Gaze point in rig-local coordinates. */
   readonly pointLocal = new Vector3(0, L.tableY, -0.4);
-  /** Raw (unfiltered) head pose in world space: "the player's eyes" for spectators looking back. */
+  /** Raw (unfiltered) head position in world space: "the player's eyes" for spectators looking back. */
   readonly headPosition = new Vector3(0, 1.2, 0);
-  readonly headQuaternion = new Quaternion();
   /** Accumulated angular travel of the filtered gaze (degrees) since the last resetTravel(). */
   travel = 0;
   /** Set once the UI exists; the gaze drives its spotlight. */
@@ -39,22 +48,31 @@ export class GazeTracker implements GazeState {
   private readonly filter = new OneEuroVec3(CFG.gazeMinCutoff, CFG.gazeBeta, 1.0, RAD);
   private readonly rawDir = new Vector3(0, 0, -1);
   private readonly prevDir = new Vector3(0, 0, -1);
-  private readonly tmp = new Vector3();
   private readonly localO = new Vector3();
   private readonly localD = new Vector3();
   private readonly q = new Quaternion();
   private readonly playerQ = new Quaternion();
-  private readonly rigQInv = new Quaternion();
   private nextMark = 0;
   private focus: GazeTarget | null = null;
   private failedTargets = new WeakSet<GazeTarget>();
+  private readonly frame: RigFrame;
+  /** World positions of this frame's best candidate and of the kept focus (each target is sampled once). */
+  private readonly bestPos = new Vector3();
+  private readonly focusPos = new Vector3();
+  private bestTarget: GazeTarget | null = null;
+  private readonly cache = new WeakMap<GazeTarget, TargetCache>();
+  /** Last spotlight handed to the UI (the UI converts every call to rig space: skip unchanged ones). */
+  private readonly spotSent = new Vector3(Number.NaN, 0, 0);
+  private spotOn = false;
 
   constructor(
     private readonly world: World,
     private readonly rig: StageRig,
     private readonly registry: GazeTargetRegistryImpl,
     private readonly events: Emitter<GameEvents>,
-  ) {}
+  ) {
+    this.frame = rigFrame(rig);
+  }
 
   resetTravel(): void {
     this.travel = 0;
@@ -68,18 +86,22 @@ export class GazeTracker implements GazeState {
   update(dt: number): void {
     this.sampleSource();
     // filtered direction
-    this.direction.copy(this.rawDir);
-    this.filter.filter(this.direction, dt);
-    if (this.direction.lengthSq() < 1e-8) this.direction.copy(this.rawDir);
-    this.direction.normalize();
-    this.travel += angleBetween(this.prevDir, this.direction) * RAD;
-    this.prevDir.copy(this.direction);
+    const d = copyV(this.direction, this.rawDir);
+    this.filter.filter(d, dt);
+    let len = Math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    if (len < 1e-4) {
+      copyV(d, this.rawDir);
+      len = Math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z) || 1;
+    }
+    setV(d, d.x / len, d.y / len, d.z / len);
+    this.travel += angleBetween(this.prevDir, d) * RAD;
+    copyV(this.prevDir, d);
 
     const target = this.pickTarget();
     if (target) {
-      target.getWorldPosition(this.point);
+      copyV(this.point, target === this.focus && target !== this.bestTarget ? this.focusPos : this.bestPos);
       this.surface = 'target';
-      this.rig.toLocal(this.point, this.pointLocal);
+      this.frame.toLocal(this.point, this.pointLocal);
     } else {
       this.castOnStage();
     }
@@ -100,13 +122,17 @@ export class GazeTracker implements GazeState {
       }
     }
 
-    // spotlight on the cloth (only when the point is on the tabletop)
+    // spotlight on the cloth (only when the point is on the tabletop); unchanged points are not re-sent
     if (this.ui) {
       const onCloth = this.spotlightEnabled && this.pointLocal.y < L.tableY + 0.04 && this.surface !== 'backdrop';
-      try {
-        this.ui.spotlight(onCloth ? this.point : null, 1);
-      } catch {
-        /* a UI failure must never break gaze */
+      if (onCloth !== this.spotOn || (onCloth && dist2(this.spotSent, this.point) > 1e-6)) {
+        this.spotOn = onCloth;
+        copyV(this.spotSent, this.point);
+        try {
+          this.ui.spotlight(onCloth ? this.point : null, 1);
+        } catch {
+          /* a UI failure must never break gaze */
+        }
       }
     }
   }
@@ -115,9 +141,9 @@ export class GazeTracker implements GazeState {
   private sampleSource(): void {
     const world = this.world;
     const immersive = !!world.session && world.visibilityState.peek() !== VisibilityState.NonImmersive;
+    // entity objects: their world matrices are current (IWSDK flushes the XR origin before the systems run)
     const head = immersive ? world.player.head : world.camera;
-    head.getWorldPosition(this.headPosition);
-    head.getWorldQuaternion(this.headQuaternion);
+    worldPos(head, this.headPosition);
     this.source = 'head';
 
     if (immersive) {
@@ -138,7 +164,7 @@ export class GazeTracker implements GazeState {
           if (pose) {
             const p = pose.transform.position;
             const o = pose.transform.orientation;
-            world.player.getWorldQuaternion(this.playerQ);
+            worldQuat(world.player, this.playerQ);
             this.origin.set(p.x, p.y, p.z).applyMatrix4(world.player.matrixWorld);
             this.q.set(o.x, o.y, o.z, o.w).premultiply(this.playerQ);
             this.rawDir.set(0, 0, -1).applyQuaternion(this.q);
@@ -147,16 +173,22 @@ export class GazeTracker implements GazeState {
           break;
         }
         if (this.source === 'head' && world.player.gazeOrigin === 'tracked') {
-          world.player.eyeSpace.getWorldPosition(this.origin);
-          world.player.eyeSpace.getWorldQuaternion(this.q);
+          worldPos(world.player.eyeSpace, this.origin);
+          worldQuat(world.player.eyeSpace, this.q);
           this.rawDir.set(0, 0, -1).applyQuaternion(this.q);
           this.source = 'eyes';
         }
       }
     }
     if (this.source === 'head') {
-      this.origin.copy(this.headPosition);
-      this.rawDir.set(0, 0, -1).applyQuaternion(this.headQuaternion);
+      copyV(this.origin, this.headPosition);
+      // forward = -Z column of the head's world matrix
+      const e = head.matrixWorld.elements;
+      const x = -e[8];
+      const y = -e[9];
+      const z = -e[10];
+      const len = Math.sqrt(x * x + y * y + z * z);
+      if (len > 1e-9) setV(this.rawDir, x / len, y / len, z / len);
     }
   }
 
@@ -170,25 +202,47 @@ export class GazeTracker implements GazeState {
     for (let i = 0; i < list.length; i++) {
       const t = list[i];
       if (this.failedTargets.has(t)) continue;
+      let c = this.cache.get(t);
+      if (!c) {
+        c = { pos: new Vector3(), age: -1 }; // once per target
+        this.cache.set(t, c);
+      }
       try {
-        if (!t.enabled()) continue;
-        t.getWorldPosition(this.tmp);
+        if (!t.enabled()) {
+          c.age = -1;
+          continue;
+        }
+        if (c.age < 0 || c.age >= GAZE_REFRESH || this.nearRay(c.pos)) {
+          t.getWorldPosition(c.pos);
+          c.age = 0;
+        } else c.age++;
       } catch (e) {
         this.failedTargets.add(t);
         console.warn(`[gaze] target "${t.id}" threw; ignoring it`, e);
         continue;
       }
-      this.tmp.sub(this.origin);
-      const dist = this.tmp.length();
+      const px = c.pos.x;
+      const py = c.pos.y;
+      const pz = c.pos.z;
+      if (px !== px) continue; // NaN: not placed yet
+      const dx = px - this.origin.x;
+      const dy = py - this.origin.y;
+      const dz = pz - this.origin.z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
       if (dist < 0.04) continue;
-      const ang = angleBetween(this.direction, this.tmp);
+      const ang = angleTo(this.direction, dx, dy, dz);
       const radius = Math.atan((t.radius || 0.01) / dist) + slack;
-      if (t === this.focus && ang <= radius * 1.25) currentAngle = ang;
+      if (t === this.focus && ang <= radius * 1.25) {
+        currentAngle = ang;
+        setV(this.focusPos, px, py, pz);
+      }
       if (ang <= radius && ang < bestAngle) {
         bestAngle = ang;
         best = t;
+        setV(this.bestPos, px, py, pz);
       }
     }
+    this.bestTarget = best;
     // keep the current focus (stable dwell timers) unless another target is clearly closer to the ray
     if (this.focus && currentAngle < Infinity && (best === null || bestAngle > currentAngle - 1.5 * DEG)) {
       return this.focus;
@@ -196,11 +250,21 @@ export class GazeTracker implements GazeState {
     return best;
   }
 
+  /** Is a (cached) target centre within ~25° of the gaze ray? */
+  private nearRay(p: Vector3): boolean {
+    const dx = p.x - this.origin.x;
+    const dy = p.y - this.origin.y;
+    const dz = p.z - this.origin.z;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-6) return true;
+    const d = this.direction;
+    return (dx * d.x + dy * d.y + dz * d.z) / len > GAZE_NEAR_COS;
+  }
+
   /** Ray hit on the tabletop plane (rig-local y = L.tableY) or the far backdrop; writes point + pointLocal. */
   private castOnStage(): void {
-    this.rig.toLocal(this.origin, this.localO);
-    this.rig.root.getWorldQuaternion(this.rigQInv).invert();
-    this.localD.copy(this.direction).applyQuaternion(this.rigQInv);
+    this.frame.toLocal(this.origin, this.localO);
+    this.frame.dirToLocal(this.direction, this.localD);
     const o = this.localO;
     const d = this.localD;
     const halfW = L.table.width / 2 + 0.08;
@@ -211,9 +275,9 @@ export class GazeTracker implements GazeState {
       const x = o.x + d.x * t;
       const z = o.z + d.z * t;
       if (t > 0 && Math.abs(x) <= halfW && z <= zNear && z >= zFar) {
-        this.pointLocal.set(x, L.tableY, z);
+        setV(this.pointLocal, x, L.tableY, z);
         this.surface = 'table';
-        this.rig.toWorld(this.pointLocal, this.point);
+        this.frame.toWorld(this.pointLocal, this.point);
         return;
       }
     }
@@ -221,8 +285,8 @@ export class GazeTracker implements GazeState {
     let t = 2.5;
     if (d.z < -0.05) t = Math.min(4, (L.posterWall.z - o.z) / d.z);
     if (!(t > 0)) t = 2.5;
-    this.pointLocal.set(o.x + d.x * t, o.y + d.y * t, o.z + d.z * t);
+    setV(this.pointLocal, o.x + d.x * t, o.y + d.y * t, o.z + d.z * t);
     this.surface = 'backdrop';
-    this.rig.toWorld(this.pointLocal, this.point);
+    this.frame.toWorld(this.pointLocal, this.point);
   }
 }

@@ -34,6 +34,7 @@ import { emptySave, loadSave } from './save.js';
 import { SeenTester } from './seen.js';
 import type { RealServices } from './services.js';
 import { SessionController } from './session.js';
+import { rigFrame } from './space.js';
 import { TrickRunner } from './tricks.js';
 
 type DebugOverlayInstaller = (world: World, opts?: Record<string, unknown>) => unknown;
@@ -173,7 +174,9 @@ export async function createGame(world: World, opts: StartOptions = {}): Promise
     reported.add(name);
     console.error(`[game] ${name} update threw (logged once):`, e);
   };
+  const frame = rigFrame(rig);
   const tick = (dt: number, t: number) => {
+    frame.sync(); // picks up a recalibration (rig-local ↔ world conversions read the cached rig matrix)
     try {
       handTracker.update(dt);
     } catch (e) {

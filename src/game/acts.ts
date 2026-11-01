@@ -116,11 +116,11 @@ export const ACTS: ActDef[] = [
         name: 'ear-poof',
         prop: 'coin',
         at: 'volunteer',
-        volunteer: 'kit3',
+        volunteer: 'kit2', // kit3 (the smallest) is still climbing back from its topple
         result: 'appear',
         final: true,
-        lines: [{ who: 'kit3', text: 'Me? ME?', mood: 'happy', delay: 0.2 }],
-        successLines: [{ who: 'kit3', text: 'From my EAR?!', mood: 'surprised' }],
+        lines: [{ who: 'kit2', text: 'Me? ME?', mood: 'happy', delay: 1.6 }], // as it lands on the mat
+        successLines: [{ who: 'kit2', text: 'From my EAR?!', mood: 'surprised' }],
       },
     ],
   },

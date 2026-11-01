@@ -34,9 +34,12 @@ export interface P3 {
   readonly z: number;
 }
 
-/** Bus trims (linear). Balanced with the offline report: music sits ~10 dB under foley and voices. */
+/**
+ * Bus trims (linear). Balanced with the offline report (src/audio/offline.ts): the café trio's loudest 50 ms sits
+ * ~10 dB under the sleight foley and ~12 dB under voices; its whole-excerpt loudness ~10 LU under foley peaks.
+ */
 export const MIX = {
-  music: 0.2,
+  music: 0.18,
   sfx: 0.85,
   voices: 0.95,
   crowd: 0.7,
@@ -51,6 +54,9 @@ export const PANNERS = 10;
 /** Scheduling lead for one-shots: never schedule into the render quantum that is already playing. */
 export const LEAD = 0.012;
 const STEAL_FADE = 0.015;
+
+/** `v` when it is a finite number, else `fallback` (NaN / Infinity / undefined never reach an AudioParam). */
+export const fin = (v: number | undefined, fallback: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : fallback);
 
 const warned = new Set<string>();
 /** Log an audio problem once per key (never throws, never spams the frame loop). */
@@ -175,10 +181,26 @@ export class NodeBag {
   }
 }
 
+/**
+ * A pooled panner remembers where it last played from (and which way the listener faced): Chrome's HRTF panner
+ * cross-fades from its previous direction over 2048 frames (~43 ms), which smears a short sound toward wherever the
+ * last one was (measured offline: a right-hand tink after a left-hand one kept only 4.7 dB of its 9.2 dB level
+ * difference). So a slot is reused as-is only for the same spot and head direction; otherwise it gets a fresh node.
+ */
 interface PannerSlot {
   node: PannerNode;
   busy: boolean;
+  x: number;
+  y: number;
+  z: number;
+  fx: number;
+  fy: number;
+  fz: number;
 }
+/** Reuse a panner as-is within this distance (m) of where it last played … */
+const PANNER_SAME_SPOT = 0.03;
+/** … and while the listener's forward is within ~6° of where it was (cos). */
+const PANNER_SAME_HEAD = 0.9945;
 
 /** A pooled one-shot voice. */
 export class VoiceSlot extends NodeBag {
@@ -193,6 +215,8 @@ export class VoiceSlot extends NodeBag {
 export interface Track {
   /** Schedule everything that starts before `until`; return true when finished. */
   pump(until: number): boolean;
+  /** Retired after an error: release what it holds (notes already scheduled ring out). */
+  abort?(): void;
 }
 
 export interface BeginOpts {
@@ -231,9 +255,11 @@ export class AudioCore {
   private duckLevel = 1;
   private duckUntil = 0;
   private listenerSet = false;
+  /** How many times the listener AudioParams were written (QA: proves still heads cost nothing). */
+  listenerWrites = 0;
   /** Last listener pose (world): position, forward, up. Used for the stereo fallback when panners run out. */
   readonly listener = { x: 0, y: 1.2, z: 0, fx: 0, fy: 0, fz: -1, ux: 0, uy: 1, uz: 0 };
-  readonly stats = { stolen: 0, refused: 0, peakVoices: 0, fallbackPans: 0 };
+  readonly stats = { stolen: 0, refused: 0, peakVoices: 0, fallbackPans: 0, pannersReused: 0, pannersFresh: 0 };
 
   constructor(ctx: BaseAudioContext, opts: { seed?: number; toDestination?: boolean } = {}) {
     this.ctx = ctx;
@@ -283,17 +309,21 @@ export class AudioCore {
 
     for (let i = 0; i < MAX_VOICES; i++) this.slots.push(new VoiceSlot());
     for (let i = 0; i < PANNERS; i++) {
-      const p = ctx.createPanner();
-      p.panningModel = 'HRTF';
-      p.distanceModel = 'inverse';
-      p.refDistance = 0.5;
-      p.maxDistance = 20;
-      p.rolloffFactor = 1;
-      p.coneInnerAngle = 360;
-      p.coneOuterAngle = 360;
-      p.coneOuterGain = 1;
-      this.panners.push({ node: p, busy: false });
+      this.panners.push({ node: this.makePanner(), busy: false, x: Number.NaN, y: 0, z: 0, fx: 0, fy: 0, fz: -1 });
     }
+  }
+
+  private makePanner(): PannerNode {
+    const p = this.ctx.createPanner();
+    p.panningModel = 'HRTF';
+    p.distanceModel = 'inverse';
+    p.refDistance = 0.5;
+    p.maxDistance = 20;
+    p.rolloffFactor = 1;
+    p.coneInnerAngle = 360;
+    p.coneOuterAngle = 360;
+    p.coneOuterGain = 1;
+    return p;
   }
 
   /** Extra output tap (offline verifier routes the limiter into a channel merger). */
@@ -321,7 +351,10 @@ export class AudioCore {
 
   /** Open a one-shot event: a voice slot, an output gain (+ reverb send) routed to a bus, spatial if `at`. */
   begin(o: BeginOpts): Ev | null {
-    const slot = this.acquire(o.priority ?? 1, !!o.loop);
+    // Sanitise first: a NaN reaching an AudioParam throws, and a throw after the slot opened would leak it.
+    const prio = fin(o.priority, 1);
+    const at = o.at && Number.isFinite(o.at.x) && Number.isFinite(o.at.y) && Number.isFinite(o.at.z) ? o.at : null;
+    const slot = this.acquire(prio, !!o.loop);
     if (!slot) {
       this.stats.refused++;
       return null;
@@ -329,23 +362,24 @@ export class AudioCore {
     const ctx = this.ctx;
     const now = ctx.currentTime;
     slot.open(this.serial++);
-    slot.priority = o.priority ?? 1;
+    slot.priority = prio;
     slot.loop = !!o.loop;
     slot.startedAt = now;
     slot.onFinish = () => this.release(slot);
     const out = slot.add(ctx.createGain());
-    out.gain.value = clamp(o.volume ?? 1, 0, 8); // caller volume (clamped 0..2 by the engine) × calibration trim
+    out.gain.value = clamp(fin(o.volume, 1), 0, 8); // caller volume (clamped 0..2 by the engine) × calibration trim
     const send = slot.add(ctx.createGain());
-    send.gain.value = o.send ?? 0.15;
+    send.gain.value = clamp(fin(o.send, 0.15), 0, 1);
     out.connect(send);
     send.connect(this.reverbIn);
     slot.out = out;
-    const busNode = this.bus[o.bus];
-    if (o.at) this.route(slot, out, o.at, busNode, now);
+    const busNode = this.bus[o.bus] ?? this.bus.sfx;
+    if (at) this.route(slot, out, at, busNode, now);
     else out.connect(busNode);
     const active = this.activeVoices();
     if (active > this.stats.peakVoices) this.stats.peakVoices = active;
-    return new Ev(this, slot, now + LEAD, out, send, clamp(o.pitch ?? 1, 0.25, 4));
+    const pitch = fin(o.pitch, 1);
+    return new Ev(this, slot, now + LEAD, out, send, clamp(pitch > 0 ? pitch : 1, 0.25, 4));
   }
 
   /** An unpooled event straight into `dest` (music notes): no slot, no panner, no send of its own. */
@@ -439,15 +473,40 @@ export class AudioCore {
   }
 
   private route(slot: VoiceSlot, out: GainNode, at: P3, busNode: AudioNode, now: number): void {
+    // the idle panner that last played nearest to this spot
+    const L = this.listener;
+    const near2 = PANNER_SAME_SPOT * PANNER_SAME_SPOT;
     let p: PannerSlot | null = null;
+    let best = Infinity;
     for (let i = 0; i < this.panners.length; i++) {
-      if (!this.panners[i].busy) {
-        p = this.panners[i];
-        break;
+      const c = this.panners[i];
+      if (c.busy) continue;
+      // a never-used node ranks after a same-spot match but before any stale one
+      const d = Number.isNaN(c.x) ? near2 * 1.0001 : (c.x - at.x) ** 2 + (c.y - at.y) ** 2 + (c.z - at.z) ** 2;
+      if (d < best) {
+        best = d;
+        p = c;
       }
     }
     if (p) {
+      const pristine = Number.isNaN(p.x);
+      const sameHead = p.fx * L.fx + p.fy * L.fy + p.fz * L.fz >= PANNER_SAME_HEAD;
+      if (pristine) {
+        /* first use: no HRTF history */
+      } else if (best <= near2 && sameHead) {
+        this.stats.pannersReused++;
+      } else {
+        // stale HRTF direction: swap in a fresh node (the idle one is already disconnected and is dropped)
+        p.node = this.makePanner();
+        this.stats.pannersFresh++;
+      }
       p.busy = true;
+      p.x = at.x;
+      p.y = at.y;
+      p.z = at.z;
+      p.fx = L.fx;
+      p.fy = L.fy;
+      p.fz = L.fz;
       slot.panner = p;
       const n = p.node;
       if (n.positionX) {
@@ -463,7 +522,6 @@ export class AudioCore {
     }
     // Pool exhausted: equal-power stereo pan from the listener-relative bearing + inverse distance.
     this.stats.fallbackPans++;
-    const L = this.listener;
     const dx = at.x - L.x, dy = at.y - L.y, dz = at.z - L.z;
     const dist = Math.hypot(dx, dy, dz);
     const rx = L.fy * L.uz - L.fz * L.uy, ry = L.fz * L.ux - L.fx * L.uz, rz = L.fx * L.uy - L.fy * L.ux;
@@ -487,6 +545,11 @@ export class AudioCore {
         finished = this.tracks[i].pump(until);
       } catch (e) {
         warnOnce('track pump failed', e);
+        try {
+          this.tracks[i].abort?.();
+        } catch {
+          /* already broken */
+        }
       }
       if (finished) {
         this.tracks[i] = this.tracks[this.tracks.length - 1];
@@ -507,22 +570,35 @@ export class AudioCore {
     p.setTargetAtTime(1, this.duckUntil + 0.08, 0.35);
   }
 
-  /** Listener pose in world space. Skips redundant writes; `immediate` for offline renders. */
+  /**
+   * Listener pose in world space (allocation-free). Skips redundant writes; `immediate` for offline renders.
+   * `write = false` only caches the pose (stereo fallback pans) while another owner — three's AudioListener, which
+   * IWSDK keeps on the XR head — drives the shared context's listener: two writers would interleave their ramps.
+   * Returns true when AudioParams were written.
+   */
   setListenerPose(
     px: number, py: number, pz: number,
     fx: number, fy: number, fz: number,
     ux: number, uy: number, uz: number,
     immediate = false,
-  ): void {
+    write = true,
+  ): boolean {
+    if (!(Number.isFinite(px + py + pz + fx + fy + fz + ux + uy + uz))) return false;
     const L = this.listener;
+    if (!write) {
+      L.x = px; L.y = py; L.z = pz; L.fx = fx; L.fy = fy; L.fz = fz; L.ux = ux; L.uy = uy; L.uz = uz;
+      this.listenerSet = false; // write in full when ownership comes back
+      return false;
+    }
     if (
       this.listenerSet &&
       Math.abs(px - L.x) + Math.abs(py - L.y) + Math.abs(pz - L.z) < 5e-4 &&
       Math.abs(fx - L.fx) + Math.abs(fy - L.fy) + Math.abs(fz - L.fz) + Math.abs(ux - L.ux) + Math.abs(uy - L.uy) + Math.abs(uz - L.uz) < 2e-3
     ) {
-      return;
+      return false;
     }
     this.listenerSet = true;
+    this.listenerWrites++;
     L.x = px; L.y = py; L.z = pz; L.fx = fx; L.fy = fy; L.fz = fz; L.ux = ux; L.uy = uy; L.uz = uz;
     const l = this.ctx.listener;
     if (l.positionX) {
@@ -542,6 +618,7 @@ export class AudioCore {
       l.setPosition(px, py, pz);
       l.setOrientation(fx, fy, fz, ux, uy, uz);
     }
+    return true;
   }
 
   dispose(): void {

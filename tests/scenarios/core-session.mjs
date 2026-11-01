@@ -90,9 +90,10 @@ export default async function session(page, api) {
     await pinch(0, 0.2);
     await turnTo(box, add(coin, [0, 0.003, 0]), 0.4);
     await waitFor((x) => x.beatKind === 'reveal' && x.phase === 'ready', 8000, 'look back → reveal ready');
-    const ear = await where('kit3-ear');
+    const earId = (await state()).revealTarget;
+    const ear = await where(earId);
     await turnTo(add(coin, [0, 0.003, 0]), ear, 0.3);
-    await waitFor((x) => x.gazeTarget === 'kit3-ear', 2000, 'gaze on the volunteer ear');
+    await waitFor((x) => x.gazeTarget === earId, 2000, 'gaze on the volunteer ear');
     await pinch(1, 0.3);
     const ev = await events();
     check(ev.some((e) => e.type === 'revealed'), 'assist reveal = look + pinch');

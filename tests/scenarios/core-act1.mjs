@@ -5,11 +5,12 @@
 //        --scenario=tests/scenarios/core-act1.mjs --out=tests/out/core-act1.png
 import { makeHelpers } from './core-lib.mjs';
 
-export default async function act1(page, api) {
-  const h = makeHelpers(page, api);
-  const { note, waitFor, check, look, turnTo, reach, pinch, poke, where, state, events, add, failures, timeline } = h;
-  try {
+/** Act I from its intro (the show's first beat) to the Act II curtain. Throws on a timeout. */
+export async function playAct1(h) {
+  const { page, api, waitFor, check, look, turnTo, reach, pinch, poke, where, state, events, add } = h;
+  {
     await waitFor((s) => s.calibrated && s.act === 1 && s.beatKind === 'intro' && s.phase === 'active', 30000, 'Act I intro running');
+    await api.shot('core-act1-first-look');
 
     // ------------------------------------------------------------------ intro: they look where you look
     const left = [-0.28, 0.905, -0.48];
@@ -82,11 +83,13 @@ export default async function act1(page, api) {
     await api.shot('core-act1-volunteer');
 
     // ------------------------------------------------------------------ reveal: poke the volunteer's ear
-    const ear = await where('kit3-ear');
-    check(!!ear, 'volunteer ear anchor is named "kit3-ear"', { ear });
+    const earId = (await state()).revealTarget;
+    check(/^kit\d-ear$/.test(earId ?? ''), 'the reveal target is the volunteer kit\'s ear', { revealTarget: earId });
+    const ear = await where(earId);
+    check(!!ear, `volunteer ear anchor is named "${earId}"`, { ear });
     await poke(add(ear, [0.01, 0.01, 0.11]), ear, 1.2);
     const ev = await events();
-    check(ev.some((e) => e.type === 'poke' && e.data.targetId === 'kit3-ear'), 'fingertip poke registered on the ear');
+    check(ev.some((e) => e.type === 'poke' && e.data.targetId === earId), 'fingertip poke registered on the ear');
     check(ev.some((e) => e.type === 'revealed'), 'poke reveals the coin');
     await page.waitForTimeout(700);
     await api.shot('core-act1-reveal');
@@ -97,6 +100,14 @@ export default async function act1(page, api) {
     check(JSON.stringify(kinds) === JSON.stringify(['intro', 'show', 'steal', 'lookBack', 'reveal']), 'Act I beat sequence', { kinds });
     check(ev2.some((e) => e.type === 'act:complete' && e.data.act === 1), "'act:complete' emitted");
     await waitFor((x) => x.act === 2 && x.beatKind === 'demo', 15000, 'curtain → Act II demo');
+  }
+}
+
+export default async function act1(page, api) {
+  const h = makeHelpers(page, api);
+  const { note, failures, timeline } = h;
+  try {
+    await playAct1(h);
   } catch (e) {
     if (!failures.includes(String(e?.message ?? e))) failures.push(String(e?.message ?? e));
   }

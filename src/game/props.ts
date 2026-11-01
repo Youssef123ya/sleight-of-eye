@@ -4,6 +4,7 @@
 import {
   AdditiveBlending,
   CanvasTexture,
+  Matrix4,
   SRGBColorSpace,
   Sprite,
   SpriteMaterial,
@@ -15,7 +16,8 @@ import type { Cafe, GameEvents, Glint, Prop, PropId, Side } from '../contracts.j
 import type { Emitter } from '../events.js';
 import type { StageRig } from '../layout.js';
 import type { HandTracker } from './hands.js';
-import { clamp01, easeInOutSine, easeOutCubic } from './math.js';
+import { clamp01, copyV, easeInOutSine, easeOutCubic, lerpV, setV } from './math.js';
+import { rigFrame, setWorldPos, worldPos, type RigFrame } from './space.js';
 
 export type PropMode = 'home' | 'lifted' | 'gliding' | 'palmed' | 'loaded' | 'shown' | 'auto' | 'hidden';
 export type Holder = Side | 'rabbit';
@@ -46,6 +48,8 @@ export class PropController {
   readonly rt = {} as Record<PropId, PropRuntime>;
   private readonly tmp = new Vector3();
   private readonly tmp2 = new Vector3();
+  private readonly m4 = new Matrix4();
+  private readonly frame: RigFrame;
   private readonly glint: Sprite;
   private readonly glintMat: SpriteMaterial;
   private readonly glintTex: CanvasTexture;
@@ -58,6 +62,7 @@ export class PropController {
     private readonly hands: HandTracker,
     private readonly events: Emitter<GameEvents>,
   ) {
+    this.frame = rigFrame(rig);
     for (const id of PROP_IDS) {
       const prop = cafe.props[id];
       if (!prop) continue;
@@ -109,14 +114,14 @@ export class PropController {
   worldPos(id: PropId, out: Vector3): Vector3 {
     const r = this.rt[id];
     if (!r) return out.set(0, 0, 0);
-    return r.prop.root.getWorldPosition(out);
+    return worldPos(r.prop.root, out);
   }
 
   /** World position of a prop's home mark. */
   homeWorld(id: PropId, out: Vector3): Vector3 {
     const r = this.rt[id];
     if (!r) return out.set(0, 0, 0);
-    return this.rig.toWorld(r.prop.home, out);
+    return this.frame.toWorld(r.prop.home, out);
   }
 
   /** Point used for grabbing/seen tests: a little above the root origin (props stand on their origin). */
@@ -335,7 +340,8 @@ export class PropController {
   update(dt: number): void {
     this.time += dt;
     let palmHolder: Holder | null = null;
-    for (const id of PROP_IDS) {
+    for (let i = 0; i < PROP_IDS.length; i++) {
+      const id = PROP_IDS[i];
       const r = this.rt[id];
       if (!r) continue;
       switch (r.mode) {
@@ -348,10 +354,12 @@ export class PropController {
           }
           r.liftTime += dt;
           // ease the grab offset to zero so the prop settles between the fingertips
-          r.offset.multiplyScalar(Math.exp(-14 * dt));
-          r.target.copy(hand.pinchPoint).add(r.offset);
+          const k = Math.exp(-14 * dt);
+          const o = setV(r.offset, r.offset.x * k, r.offset.y * k, r.offset.z * k);
+          const pp = hand.pinchPoint;
+          setV(r.target, pp.x + o.x, pp.y + o.y, pp.z + o.z);
           this.worldPos(id, this.tmp);
-          this.tmp.lerp(r.target, 1 - Math.exp(-30 * dt));
+          lerpV(this.tmp, this.tmp, r.target, 1 - Math.exp(-30 * dt));
           this.setWorld(r, this.tmp);
           break;
         }
@@ -359,7 +367,7 @@ export class PropController {
           r.t += dt;
           const u = clamp01(r.t / GLIDE_TIME);
           this.homeWorld(id, this.tmp2);
-          this.tmp.copy(r.from).lerp(this.tmp2, easeOutCubic(u));
+          lerpV(this.tmp, r.from, this.tmp2, easeOutCubic(u));
           this.tmp.y += Math.sin(Math.PI * u) * 0.025;
           this.setWorld(r, this.tmp);
           if (u >= 1) {
@@ -373,7 +381,7 @@ export class PropController {
           r.t += dt;
           const u = clamp01(r.t / AUTO_LIFT_TIME);
           const h = Math.sin(Math.PI * easeInOutSine(u)) * 0.07;
-          this.tmp.copy(r.from);
+          copyV(this.tmp, r.from);
           this.tmp.y += h;
           this.setWorld(r, this.tmp);
           if (u >= 1) {
@@ -405,8 +413,7 @@ export class PropController {
     // glint in the fist (player-only cue)
     if (palmHolder && palmHolder !== 'rabbit' && this.hands.states[palmHolder].tracked) {
       const hand = this.hands.states[palmHolder];
-      this.rig.toLocal(hand.palm, this.tmp);
-      this.glint.position.copy(this.tmp);
+      this.frame.toLocal(hand.palm, this.glint.position);
       this.glint.visible = true;
       const pulse = 0.75 + 0.25 * Math.sin(this.time * 6.0);
       this.glintMat.opacity = pulse;
@@ -424,7 +431,7 @@ export class PropController {
 
   // ------------------------------------------------------------------------------------------- internals
   private startGlide(r: PropRuntime): void {
-    r.prop.root.getWorldPosition(r.from);
+    worldPos(r.prop.root, r.from);
     r.mode = 'gliding';
     r.t = 0;
   }
@@ -456,24 +463,15 @@ export class PropController {
 
   /** Write a world position into the prop root (whatever its parent is). */
   private setWorld(r: PropRuntime, world: Vector3): void {
-    const root = r.prop.root;
-    const parent = root.parent;
-    if (parent) {
-      this.tmp2.copy(world);
-      parent.updateWorldMatrix(true, false);
-      parent.worldToLocal(this.tmp2);
-      root.position.copy(this.tmp2);
-    } else {
-      root.position.copy(world);
-    }
+    setWorldPos(r.prop.root, world, this.m4);
   }
 
   private placeInside(id: PropId, into: PropId): void {
     const r = this.rt[id];
     const host = this.rt[into];
     if (!r || !host) return;
-    this.rig.toWorld(host.prop.home, this.tmp);
-    this.tmp.y += into === 'cupcake' ? 0.02 : 0.002;
+    this.frame.toWorld(host.prop.home, this.tmp);
+    if (into === 'cupcake') this.tmp.y += 0.02; // inside the box; under a cup it stands on the mat
     this.setWorld(r, this.tmp);
   }
 }

@@ -326,7 +326,11 @@ class StubUI implements UI {
     });
   }
 
-  review(data: ReviewData): void {
+  review(data: ReviewData | null): void {
+    if (!data) {
+      if (this.review_) this.review_.visible = false;
+      return;
+    }
     const W = 512;
     const H = 640;
     const c = document.createElement('canvas');
@@ -355,7 +359,7 @@ class StubUI implements UI {
     });
     g.textAlign = 'center';
     g.font = 'italic 26px Georgia, serif';
-    wrap(g, data.quote, W / 2, 500, W - 70, 32);
+    wrap(g, `“${data.quote}” — Sir Brock`, W / 2, 500, W - 70, 32);
     const tex = new CanvasTexture(c);
     tex.colorSpace = SRGBColorSpace;
     if (!this.review_) {

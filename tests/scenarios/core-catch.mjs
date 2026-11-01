@@ -57,7 +57,7 @@ export default async function catchPath(page, api) {
     await reach(grab, add(grab, [0.08, 0.06, 0.16]), 0.4, 0);
     await turnTo(box, add(coin, [0, 0.003, 0]), 0.5);
     await waitFor((x) => x.beatKind === 'reveal' && x.phase === 'ready', 9000, 'look back → volunteer ready');
-    const ear = await where('kit3-ear');
+    const ear = await where((await state()).revealTarget);
     await poke(add(ear, [0.01, 0.01, 0.11]), ear, 1.2);
     s = await waitFor((x) => x.stars[0] >= 1, 8000, 'Act I complete');
     check(s.stars[0] === 1, 'a caught act earns exactly 1 star', { stars: s.stars });

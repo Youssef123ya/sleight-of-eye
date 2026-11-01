@@ -8,6 +8,7 @@ import type { GazeTracker } from './gaze.js';
 import type { HandTracker } from './hands.js';
 import type { PropController } from './props.js';
 import { writeSave, type SaveData } from './save.js';
+import { rigFrame, worldPos } from './space.js';
 import type { TrickRunner } from './tricks.js';
 
 const ALL_PLAQUES: PlaqueAction[] = ['retry', 'easy', 'assist', 'recenter', 'exit'];
@@ -86,7 +87,7 @@ export class SessionController {
   update(dt: number): void {
     if (this.immersive && this.wantCalibrate) {
       this.xrFrames++;
-      this.ctx.world.player.head.getWorldPosition(this.tmp);
+      worldPos(this.ctx.world.player.head, this.tmp);
       const moved = this.tmp.distanceTo(this.lastHead);
       this.lastHead.copy(this.tmp);
       const valid = this.tmp.lengthSq() > 1e-6;
@@ -114,6 +115,7 @@ export class SessionController {
     const head = this.immersive ? world.player.head : world.camera;
     try {
       rig.calibrateFromHead(head);
+      rigFrame(rig).sync();
     } catch (e) {
       console.warn('[session] calibration failed', e);
       return;
@@ -131,9 +133,15 @@ export class SessionController {
         beat = 0;
       }
       this.runner.begin(act, beat);
+    } else if (this.freshSession && this.runner.act >= 4) {
+      // back in after leaving from the bow: tonight's show starts again
+      this.runner.restartShow();
     }
+    this.freshSession = false;
     this.applyRunState();
   }
+  /** Set on entering XR; the first calibration of a session may restart a finished show. */
+  private freshSession = false;
 
   setSettings(patch: Partial<Settings>): void {
     this.ctx.settings.value = { ...this.ctx.settings.peek(), ...patch };
@@ -179,6 +187,7 @@ export class SessionController {
   private enterImmersive(): void {
     const { world, audio } = this.ctx;
     this.immersive = true;
+    this.freshSession = true;
     this.wantCalibrate = true;
     this.calibrated = false;
     this.xrFrames = 0;
@@ -214,6 +223,13 @@ export class SessionController {
     this.immersive = false;
     this.wantCalibrate = false;
     this.holdIt = false;
+    this.paused = false;
+    // the 2D attract view behind the landing page shows an open stage (after Exit, or leaving from a pause)
+    try {
+      void Promise.resolve(this.ctx.ui.curtain('open')).catch(() => {});
+    } catch {
+      /* cosmetic */
+    }
     try {
       this.ctx.ui.banner(null);
     } catch {
@@ -228,11 +244,6 @@ export class SessionController {
       this.ctx.audio.setPaused(true);
     } catch {
       /* optional */
-    }
-    if (this.paused) {
-      // leaving XR from a blurred state: lift the curtain for the 2D attract view
-      this.paused = false;
-      void this.ctx.ui.curtain('open');
     }
     this.applyRunState();
   }
@@ -307,14 +318,38 @@ export class SessionController {
         if (this.immersive) this.calibrate();
         break;
       case 'exit':
-        try {
-          this.ctx.world.exitXR();
-        } catch (e) {
-          console.warn('[session] exitXR failed', e);
-        }
+        this.exit();
         break;
     }
   }
+
+  /**
+   * Exit plaque: the curtain falls, then the session ends (back to the landing page). The XR session is never
+   * ended from inside the frame that handled the poke, and a slow curtain cannot keep the player in XR.
+   */
+  private exit(): void {
+    if (this.exiting || !this.immersive) return;
+    this.exiting = true;
+    let done = false;
+    const leave = () => {
+      if (done) return;
+      done = true;
+      this.exiting = false;
+      try {
+        if (this.ctx.world.session) this.ctx.world.exitXR();
+      } catch (e) {
+        console.warn('[session] exitXR failed', e);
+      }
+    };
+    try {
+      this.ctx.audio.sfx('curtain');
+      void this.ctx.ui.curtain('closed').then(leave, leave);
+    } catch {
+      /* cosmetic */
+    }
+    setTimeout(leave, 1600);
+  }
+  private exiting = false;
 
   private applySettings(s: Settings): void {
     try {

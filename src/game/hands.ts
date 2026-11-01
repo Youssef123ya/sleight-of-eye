@@ -4,7 +4,9 @@ import { Vector3, type World } from '@iwsdk/core';
 import { CFG } from '../config.js';
 import type { GameEvents, HandState, PokeTarget, Side } from '../contracts.js';
 import type { Emitter } from '../events.js';
+import { copyV, setV } from './math.js';
 import { PokeRegistryImpl } from './registries.js';
+import { worldPos } from './space.js';
 
 export const SIDES: readonly Side[] = ['left', 'right'];
 
@@ -73,7 +75,14 @@ export class HandStateImpl implements HandState {
 interface PokeSlot {
   armed: [boolean, boolean];
   hover: [boolean, boolean];
+  /** Cached world centre: re-read every frame while a fingertip is near, else every POKE_REFRESH frames. */
+  readonly pos: Vector3;
+  age: number;
 }
+
+/** A fingertip farther than radius + this from a target's cached centre cannot hover or poke it this frame. */
+const POKE_NEAR = 0.2;
+const POKE_REFRESH = 12;
 
 export class HandTracker {
   readonly states: Record<Side, HandStateImpl> = { left: new HandStateImpl('left'), right: new HandStateImpl('right') };
@@ -83,7 +92,6 @@ export class HandTracker {
   private readonly jointSpaces: Record<Side, XRJointSpace[] | null> = { left: null, right: null };
   private readonly spacesFor: Record<Side, XRInputSource | null> = { left: null, right: null };
   private readonly poses = new Float32Array(25 * 16);
-  private readonly tmp = new Vector3();
   private readonly slots = new WeakMap<PokeTarget, PokeSlot>();
   private readonly failed = new WeakSet<PokeTarget>();
   private prevActive: Record<Side, boolean> = { left: false, right: false };
@@ -126,13 +134,12 @@ export class HandTracker {
           ok = this.readHand(side, src, frame, ref, s);
         } else {
           s.isHand = false;
-          const grip = world.player.gripSpaces[side];
-          grip.getWorldPosition(s.palm);
-          s.pinchPoint.copy(s.palm);
-          s.indexTip.copy(s.palm);
-          s.wrist.copy(s.palm);
-          s.thumbTip.copy(s.palm);
-          s.joints[0].copy(s.palm);
+          worldPos(world.player.gripSpaces[side], s.palm);
+          copyV(s.pinchPoint, s.palm);
+          copyV(s.indexTip, s.palm);
+          copyV(s.wrist, s.palm);
+          copyV(s.thumbTip, s.palm);
+          copyV(s.joints[0], s.palm);
           ok = true;
         }
       }
@@ -150,12 +157,15 @@ export class HandTracker {
         this.events.emit('hands:trackingFound', { side });
       }
       if (s.hasPrev && dt > 0) {
-        s.velocity.copy(s.palm).sub(s.prevPalm).divideScalar(dt);
-        const v = s.velocity.length();
+        const vx = (s.palm.x - s.prevPalm.x) / dt;
+        const vy = (s.palm.y - s.prevPalm.y) / dt;
+        const vz = (s.palm.z - s.prevPalm.z) / dt;
+        setV(s.velocity, vx, vy, vz);
+        const v = Math.sqrt(vx * vx + vy * vy + vz * vz);
         s.speed += (Math.min(v, 3) - s.speed) * (1 - Math.exp(-8 * dt));
         s.stillFor = v > 0.12 ? 0 : s.stillFor + dt;
       }
-      s.prevPalm.copy(s.palm);
+      copyV(s.prevPalm, s.palm);
       s.hasPrev = true;
     } else {
       s.rawTracked = false;
@@ -223,12 +233,17 @@ export class HandTracker {
     if (typeof batch.fillPoses === 'function') {
       if (!batch.fillPoses(spaces, ref, this.poses)) return false;
       const p = this.poses;
+      const e = m.elements;
       for (let i = 0; i < 25; i++) {
         const x = p[i * 16 + 12];
         const y = p[i * 16 + 13];
         const z = p[i * 16 + 14];
         if (x !== x || y !== y || z !== z) return false; // NaN = untracked
-        s.joints[i].set(x, y, z).applyMatrix4(m);
+        // player space → world (the XR origin is rigid; plain arithmetic, no three helpers per joint)
+        const j = s.joints[i];
+        j.x = e[0] * x + e[4] * y + e[8] * z + e[12];
+        j.y = e[1] * x + e[5] * y + e[9] * z + e[13];
+        j.z = e[2] * x + e[6] * y + e[10] * z + e[14];
       }
     } else {
       for (let k = 0; k < NEEDED_JOINTS.length; k++) {
@@ -239,18 +254,19 @@ export class HandTracker {
         s.joints[i].set(p.x, p.y, p.z).applyMatrix4(m);
       }
     }
-    s.wrist.copy(s.joints[J_WRIST]);
-    s.thumbTip.copy(s.joints[J_THUMB_TIP]);
-    s.indexTip.copy(s.joints[J_INDEX_TIP]);
-    s.pinchPoint.copy(s.thumbTip).add(s.indexTip).multiplyScalar(0.5);
-    s.palm.copy(s.wrist).add(s.joints[J_MIDDLE_PROX]).multiplyScalar(0.5);
+    const w = copyV(s.wrist, s.joints[J_WRIST]);
+    const th = copyV(s.thumbTip, s.joints[J_THUMB_TIP]);
+    const ix = copyV(s.indexTip, s.joints[J_INDEX_TIP]);
+    setV(s.pinchPoint, (th.x + ix.x) * 0.5, (th.y + ix.y) * 0.5, (th.z + ix.z) * 0.5);
+    const mp = s.joints[J_MIDDLE_PROX];
+    setV(s.palm, (w.x + mp.x) * 0.5, (w.y + mp.y) * 0.5, (w.z + mp.z) * 0.5);
     return true;
   }
 
   private slotFor(t: PokeTarget): PokeSlot {
     let slot = this.slots.get(t);
     if (!slot) {
-      slot = { armed: [false, false], hover: [false, false] };
+      slot = { armed: [false, false], hover: [false, false], pos: new Vector3(), age: -1 };
       this.slots.set(t, slot);
     }
     return slot;
@@ -263,16 +279,24 @@ export class HandTracker {
       const t = list[i];
       if (!t || this.failed.has(t)) continue;
       const slot = this.slotFor(t);
+      const r = PokeRegistryImpl.radiusOf(t);
       let enabled = false;
       try {
         enabled = t.enabled();
-        if (enabled) t.getWorldPosition(this.tmp);
+        // targets barely move: re-read the centre when a fingertip is close to it (or now and then)
+        if (enabled && (slot.age < 0 || slot.age >= POKE_REFRESH || this.tipNear(slot.pos, r + POKE_NEAR))) {
+          t.getWorldPosition(slot.pos);
+          slot.age = 0;
+        } else if (enabled) slot.age++;
+        else slot.age = -1;
       } catch (e) {
         this.failed.add(t);
         console.warn(`[hands] poke target "${t.id}" threw; ignoring it`, e);
         continue;
       }
-      const r = PokeRegistryImpl.radiusOf(t);
+      const tx = slot.pos.x;
+      const ty = slot.pos.y;
+      const tz = slot.pos.z;
       for (let k = 0; k < 2; k++) {
         const side = SIDES[k];
         const s = this.states[side];
@@ -284,7 +308,11 @@ export class HandTracker {
           }
           continue;
         }
-        const d = s.indexTip.distanceTo(this.tmp);
+        const tip = s.indexTip;
+        const dx = tip.x - tx;
+        const dy = tip.y - ty;
+        const dz = tip.z - tz;
+        const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
         if (d > r + CFG.pokeHysteresis) slot.armed[k] = true;
         const hover = d < r + 0.04;
         if (hover !== slot.hover[k]) {
@@ -304,6 +332,21 @@ export class HandTracker {
         }
       }
     }
+  }
+
+  /** Is a tracked index fingertip within `dist` of `p`? */
+  private tipNear(p: Vector3, dist: number): boolean {
+    const d2 = dist * dist;
+    for (let k = 0; k < 2; k++) {
+      const s = this.states[SIDES[k]];
+      if (!s.tracked) continue;
+      const tip = s.indexTip;
+      const dx = tip.x - p.x;
+      const dy = tip.y - p.y;
+      const dz = tip.z - p.z;
+      if (dx * dx + dy * dy + dz * dz < d2) return true;
+    }
+    return false;
   }
 
   private safeHover(t: PokeTarget, hovered: boolean, side: Side): void {

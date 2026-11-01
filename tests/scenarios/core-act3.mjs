@@ -6,9 +6,9 @@
 //        --scenario=tests/scenarios/core-act3.mjs --out=tests/out/core-act3.png
 import { makeHelpers } from './core-lib.mjs';
 
-export default async function act3(page, api) {
-  const h = makeHelpers(page, api);
-  const { note, waitFor, check, look, turnTo, reach, pinch, poke, where, state, events, add, failures, timeline } = h;
+/** Act III from its rule demo through the bow (`skip`: jump there with skipTo first). Throws on a timeout. */
+export async function playAct3(h, { skip = true } = {}) {
+  const { page, api, waitFor, check, look, turnTo, reach, pinch, poke, where, state, add } = h;
   const angleTo = async (id, pt) => {
     const s = await state();
     const m = s.spectators.find((x) => x.id === id);
@@ -19,10 +19,12 @@ export default async function act3(page, api) {
     const dot = (d[0] * m.look[0] + d[1] * m.look[1] + d[2] * m.look[2]) / len;
     return (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
   };
-  try {
-    await waitFor((s) => s.calibrated && s.started, 30000, 'show started');
-    await page.evaluate(() => window.__app.skipTo(3, 0));
-    await waitFor((s) => s.act === 3 && s.beatKind === 'demo' && s.phase === 'active', 5000, 'Act III rule demo');
+  {
+    if (skip) {
+      await waitFor((s) => s.calibrated && s.started, 30000, 'show started');
+      await page.evaluate(() => window.__app.skipTo(3, 0));
+    }
+    await waitFor((s) => s.act === 3 && s.beatKind === 'demo' && s.phase === 'active', skip ? 5000 : 15000, 'Act III rule demo');
 
     // Brock watches the hand, wherever you look
     const handAt = [0.2, 0.98, -0.32];
@@ -74,7 +76,7 @@ export default async function act3(page, api) {
     await reach(grab, loadAt, 0.45, 0);
     await pinch(1, 0.3);
     s = await waitFor((x) => x.beatKind === 'lookBack', 2000, 'watch loaded into the cupcake box');
-    check(s.loaded === 'watch->cupcake' && s.caught === 0, 'loaded unseen', { loaded: s.loaded, caught: s.caught });
+    check(s.loaded?.watch === 'cupcake' && s.catchesThisAct === 0, 'loaded unseen', { loaded: s.loaded, catchesThisAct: s.catchesThisAct });
     await pinch(0, 0.2);
     await reach(loadAt, add(loadAt, [0.1, 0.05, 0.15]), 0.4, 0);
 
@@ -96,6 +98,14 @@ export default async function act3(page, api) {
     const retryPlaque = await where('plaque-retry');
     check(!!exitPlaque && !!retryPlaque, 'Retry + Exit plaques at the bow');
     await api.shot('core-act3-bow');
+  }
+}
+
+export default async function act3(page, api) {
+  const h = makeHelpers(page, api);
+  const { note, failures, timeline } = h;
+  try {
+    await playAct3(h, { skip: true });
   } catch (e) {
     if (!failures.includes(String(e?.message ?? e))) failures.push(String(e?.message ?? e));
   }

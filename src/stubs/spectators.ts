@@ -504,6 +504,14 @@ class StubSpectator implements Spectator {
     this.coneMat.opacity = alarm ? 0.32 : 0.12;
   }
 
+  /** The cone mesh is built at CFG.sightHalfAngle; other widths scale its radius (x/y; the axis is +Z). */
+  setSightHalfAngle(deg: number): void {
+    const base = Math.tan((CFG.sightHalfAngle * Math.PI) / 180);
+    const want = Math.tan((Math.max(1, Math.min(80, deg || CFG.sightHalfAngle)) * Math.PI) / 180);
+    const r = want / base / this.scale;
+    this.cone.scale.set(r, r, 1 / this.scale);
+  }
+
   setMood(mood: 'neutral' | 'eyeContact' | 'flustered' | 'suspicious'): void {
     this.mood = mood;
     this.blush.visible = mood === 'flustered' || mood === 'eyeContact' || this.reaction?.name === 'blushScribble';

@@ -7,9 +7,14 @@
 //
 // `EngineImpl` holds all of the actual sound logic and runs on any BaseAudioContext, so the offline verifier
 // (src/audio/offline.ts) renders exactly the code the game plays.
-import { AudioContext as ThreeAudioContext, Quaternion, Vector3, type Object3D } from '@iwsdk/core';
+//
+// Robustness: the page going hidden suspends the context (and resuming it waits for visibility AND the game's
+// setPaused(false)); the scheduler slides its grid after main-thread stalls instead of scheduling into the past;
+// non-finite inputs never reach an AudioParam; every public method swallows (and logs once) its own errors.
+// QA: `window.__audio` is the debug view of the most recently created engine (state, voices, meter, …).
+import { AudioContext as ThreeAudioContext, type Object3D } from '@iwsdk/core';
 import type { AudioEngine, CrowdKind, Mood, SfxName, SpectatorKind } from '../contracts.js';
-import { AudioCore, MIX, warnOnce, type Ev, type P3 } from './core.js';
+import { AudioCore, fin, MIX, warnOnce, type Ev, type P3 } from './core.js';
 import { CROWD_PRIORITY, crowdSound } from './crowd.js';
 import { clamp, hold } from './dsp.js';
 import { Music, MusicBoxTrack, type MusicMood } from './music.js';
@@ -17,9 +22,15 @@ import { TensionPad } from './pad.js';
 import { SFX } from './sfx.js';
 import { speak } from './voice.js';
 
-/** Lookahead scheduler: a 25 ms timer schedules everything within the next 100 ms of audio time. */
+/**
+ * Lookahead scheduler: a 25 ms timer schedules everything within the next 200 ms of audio time, so a main-thread
+ * hitch of up to ~175 ms (shader compile, GC, a long frame on Quest) never makes the music late.
+ */
 export const TICK_MS = 25;
-export const LOOKAHEAD = 0.1;
+export const LOOKAHEAD = 0.2;
+/** Music box length when the caller passes NaN; Infinity (Easy Audience) plays the longest show. */
+const MUSIC_BOX_DEFAULT = 5;
+const MUSIC_BOX_MAX = 30;
 
 export interface LoopHandle {
   stop(): void;
@@ -64,7 +75,7 @@ export class EngineImpl {
     const ev = this.core.begin({
       bus: 'sfx',
       at: opts?.at,
-      volume: clamp(Number.isFinite(opts?.volume) ? (opts?.volume as number) : 1, 0, 2) * spec.trim,
+      volume: clamp(fin(opts?.volume, 1), 0, 2) * spec.trim,
       pitch: opts?.pitch,
       priority: spec.prio,
       send: spec.send,
@@ -83,9 +94,15 @@ export class EngineImpl {
     if (!ev) return NOOP_LOOP;
     const g = ev.gain(0, ev.out);
     const level = name === 'fuse' ? 1.4 : 1.0;
-    g.gain.setValueAtTime(0, ev.t);
-    g.gain.linearRampToValueAtTime(level, ev.t + 0.03);
-    const src = ev.buffer(name === 'fuse' ? ev.res.fuse : ev.res.tick, ev.t, ev.t + 36000, g, true);
+    let src: AudioBufferSourceNode;
+    try {
+      g.gain.setValueAtTime(0, ev.t);
+      g.gain.linearRampToValueAtTime(level, ev.t + 0.03);
+      src = ev.buffer(name === 'fuse' ? ev.res.fuse : ev.res.tick, ev.t, ev.t + 36000, g, true);
+    } catch (e) {
+      ev.bag.finish(); // never leak the voice slot
+      throw e;
+    }
     const bag = ev.bag;
     const serial = bag.serial;
     const ctx = this.ctx;
@@ -135,13 +152,20 @@ export class EngineImpl {
 
   musicBox(at: P3 | null | undefined, seconds: number): void {
     // Easy Audience passes Infinity: the contract has no stop for it, so the box plays up to 30 s.
-    const secs = clamp(Number.isFinite(seconds) ? seconds : 30, 0.5, 30);
+    const s = typeof seconds === 'number' && !Number.isNaN(seconds) ? seconds : MUSIC_BOX_DEFAULT;
+    const secs = clamp(s === Infinity ? MUSIC_BOX_MAX : s, 0.5, MUSIC_BOX_MAX);
     const ev = this.core.begin({ bus: 'sfx', at, priority: 3, send: 0.3 });
     if (!ev) return;
-    const track = new MusicBoxTrack(ev, secs);
+    let track: MusicBoxTrack;
+    try {
+      track = new MusicBoxTrack(ev, secs);
+    } catch (e) {
+      ev.bag.finish(); // never leak the voice slot
+      throw e;
+    }
     this.core.addTrack(track);
     this.core.duck(0.4, ev.t, ev.t + track.duration - 1.6); // the trio listens to the music box
-    track.pump(this.ctx.currentTime + LOOKAHEAD);
+    this.core.pumpTracks(this.ctx.currentTime + LOOKAHEAD); // first notes now (guarded: a throwing track is retired)
   }
 
   setMood(m: MusicMood): void {
@@ -164,8 +188,9 @@ export class EngineImpl {
     fx: number, fy: number, fz: number,
     ux: number, uy: number, uz: number,
     immediate = false,
-  ): void {
-    this.core.setListenerPose(px, py, pz, fx, fy, fz, ux, uy, uz, immediate);
+    write = true,
+  ): boolean {
+    return this.core.setListenerPose(px, py, pz, fx, fy, fz, ux, uy, uz, immediate, write);
   }
 
   setMasterVolume(v: number): void {
@@ -200,29 +225,39 @@ export class EngineImpl {
 
 // ------------------------------------------------------------------------------------- the live engine
 
-const _pos = new Vector3();
-const _quat = new Quaternion();
-const _fwd = new Vector3();
-const _up = new Vector3();
-
 export interface AudioMeter {
   peak: number;
   rms: number;
 }
 
-/** Debug/QA view of a live engine (demo meters, tests). Not part of the game contract. */
+/** Debug/QA view of a live engine (demo meters, tests, `window.__audio`). Not part of the game contract. */
 export interface AudioDebug {
   /** 'locked' before unlock, else the AudioContext state. */
   readonly state: string;
   readonly voices: number;
   readonly panners: number;
   readonly stats: { stolen: number; refused: number; peakVoices: number; fallbackPans: number } | null;
+  /** Who writes the context's listener: 'engine', 'three' (IWSDK's AudioListener on the XR head) or 'none' yet. */
+  readonly listenerOwner: 'engine' | 'three' | 'none';
+  /** Listener AudioParam writes by this engine so far (a still head adds none). */
+  readonly listenerWrites: number;
+  /** setPaused(true) from the game. */
+  readonly paused: boolean;
+  /** The page is hidden (the engine suspends itself). */
+  readonly hidden: boolean;
+  /** The engine itself (QA scripts call the contract through it). */
+  readonly engine: AudioEngine;
   /** Master output level over the last ~20 ms (allocation-free; writes into `out`). */
   meter(out: AudioMeter): AudioMeter;
   impl(): EngineImpl | null;
   context(): AudioContext | null;
   dispose(): void;
 }
+
+/** DOM events that count as user activation: a context the browser refused to start retries on the next one. */
+const GESTURES = ['pointerdown', 'pointerup', 'keydown', 'touchend', 'click'] as const;
+/** How often to look again for a three AudioListener driving the shared context (ms). */
+const LISTENER_SCAN_MS = 2000;
 
 class LiveAudioEngine implements AudioEngine {
   private impl: EngineImpl | null = null;
@@ -237,6 +272,13 @@ class LiveAudioEngine implements AudioEngine {
   private maxWatchers = 1;
   private volume = 1;
   private paused = false;
+  private hidden = false;
+  private pageHooked = false;
+  private gestureArmed = false;
+  private threeListener: Object3D | null = null;
+  private scanRoot: Object3D | null = null;
+  private listenerScanAt = -Infinity;
+  private owner: 'engine' | 'three' | 'none' = 'none';
   readonly music: AudioEngine['music'];
   readonly debug: AudioDebug;
 
@@ -250,10 +292,11 @@ class LiveAudioEngine implements AudioEngine {
       stop: (fadeSeconds?: number) =>
         this.guard('music.stop', () => {
           this.wantMusic = false;
-          this.impl?.music.stop(fadeSeconds ?? 1.5);
+          this.impl?.music.stop(fin(fadeSeconds, 1.5));
         }),
       setMood: (mood) =>
         this.guard('music.setMood', () => {
+          if (mood !== 'calm' && mood !== 'tense' && mood !== 'triumph') return;
           this.mood = mood;
           this.impl?.setMood(mood);
         }),
@@ -272,6 +315,19 @@ class LiveAudioEngine implements AudioEngine {
       get stats() {
         return self.impl ? self.impl.core.stats : null;
       },
+      get listenerOwner() {
+        return self.owner;
+      },
+      get listenerWrites() {
+        return self.impl ? self.impl.core.listenerWrites : 0;
+      },
+      get paused() {
+        return self.paused;
+      },
+      get hidden() {
+        return self.hidden;
+      },
+      engine: this,
       meter: (out) => this.readMeter(out),
       impl: () => this.impl,
       context: () => this.ctx,
@@ -287,10 +343,10 @@ class LiveAudioEngine implements AudioEngine {
     }
   }
 
-  /** True when one-shots should sound (unlocked, running, not paused): queued sounds never burst on resume. */
+  /** True when one-shots should sound (unlocked, running, not paused/hidden): queued sounds never burst on resume. */
   private live(): EngineImpl | null {
     const impl = this.impl;
-    if (!impl || this.paused || !this.ctx || this.ctx.state !== 'running') return null;
+    if (!impl || this.paused || this.hidden || !this.ctx || this.ctx.state !== 'running') return null;
     return impl;
   }
 
@@ -308,9 +364,11 @@ class LiveAudioEngine implements AudioEngine {
         impl.setTension(this.watchers, this.maxWatchers);
         if (this.wantMusic) impl.music.start();
         this.timer = setInterval(this.tick, TICK_MS);
-        if (this.paused) this.applyPause(true);
+        this.hookPage();
+        if (this.paused || this.hidden) this.applyPause(true);
         setTimeout(() => this.guard('warm-up', () => impl.warm()), 0); // ~10 ms of buffer synthesis, off the gesture
       }
+      if (ctx.state !== 'running') this.armGestureRetry();
       // never hang the Enter flow: resume() stays pending forever when the browser refuses to start audio
       return Promise.race([resumed, new Promise((r) => setTimeout(r, 1500))]).then(() => undefined);
     } catch (e) {
@@ -330,12 +388,59 @@ class LiveAudioEngine implements AudioEngine {
     }
   };
 
-  sfx(name: SfxName, opts?: { at?: Vector3; volume?: number; pitch?: number }): void {
+  // ------------------------------------------------------------------------------- page lifecycle
+
+  /** Hidden page → fade + suspend (no CPU, no backlog); visible again → resume unless the game paused us. */
+  private hookPage(): void {
+    if (this.pageHooked || typeof document === 'undefined') return;
+    this.pageHooked = true;
+    document.addEventListener('visibilitychange', this.onVisibility);
+    this.onVisibility();
+  }
+
+  private readonly onVisibility = (): void => {
+    const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+    if (hidden === this.hidden) return;
+    this.hidden = hidden;
+    this.guard('visibility', () => this.applyPause(this.paused || this.hidden));
+  };
+
+  /** The browser refused to start audio (no activation yet): retry on the next user gesture. */
+  private armGestureRetry(): void {
+    if (this.gestureArmed || typeof window === 'undefined') return;
+    this.gestureArmed = true;
+    for (const t of GESTURES) window.addEventListener(t, this.onGesture, true);
+  }
+
+  private disarmGestureRetry(): void {
+    if (!this.gestureArmed) return;
+    this.gestureArmed = false;
+    for (const t of GESTURES) window.removeEventListener(t, this.onGesture, true);
+  }
+
+  private readonly onGesture = (): void => {
+    const ctx = this.ctx;
+    if (!ctx || ctx.state === 'running' || ctx.state === 'closed') {
+      this.disarmGestureRetry();
+      return;
+    }
+    if (this.paused || this.hidden) return;
+    ctx
+      .resume()
+      .then(() => {
+        if (ctx.state === 'running') this.disarmGestureRetry();
+      })
+      .catch(() => undefined);
+  };
+
+  // ------------------------------------------------------------------------------------ contract
+
+  sfx(name: SfxName, opts?: { at?: Vector3Like; volume?: number; pitch?: number }): void {
     const impl = this.live();
     if (impl) this.guard(`sfx ${name}`, () => impl.sfx(name, opts));
   }
 
-  loop(name: 'fuse' | 'tick', at?: Vector3): { stop(): void } {
+  loop(name: 'fuse' | 'tick', at?: Vector3Like): { stop(): void } {
     const impl = this.live();
     if (!impl) return NOOP_LOOP;
     try {
@@ -346,46 +451,83 @@ class LiveAudioEngine implements AudioEngine {
     }
   }
 
-  say(text: string, opts: { at: Vector3; voice: SpectatorKind; mood?: Mood }): void {
+  say(text: string, opts: { at: Vector3Like; voice: SpectatorKind; mood?: Mood }): void {
     const impl = this.live();
     if (impl && opts) this.guard('say', () => impl.say(text, opts.at, opts.voice, opts.mood));
   }
 
-  crowd(kind: CrowdKind, intensity: number, at?: Vector3): void {
+  crowd(kind: CrowdKind, intensity: number, at?: Vector3Like): void {
     const impl = this.live();
     if (impl) this.guard(`crowd ${kind}`, () => impl.crowd(kind, intensity, at));
   }
 
-  musicBox(at: Vector3, seconds: number): void {
+  musicBox(at: Vector3Like, seconds: number): void {
     const impl = this.live();
     if (impl) this.guard('musicBox', () => impl.musicBox(at, seconds));
   }
 
+  /** Safe to call every frame: no allocation, and the pad ignores unchanged levels. */
   setTension(watchers: number, maxWatchers: number): void {
-    this.watchers = watchers;
-    this.maxWatchers = maxWatchers;
+    this.watchers = fin(watchers, 0);
+    this.maxWatchers = fin(maxWatchers, 1);
     const impl = this.impl;
-    if (impl) this.guard('setTension', () => impl.setTension(watchers, maxWatchers));
+    if (!impl) return;
+    try {
+      impl.setTension(this.watchers, this.maxWatchers);
+    } catch (e) {
+      warnOnce('setTension failed', e);
+    }
   }
 
-  /** Per frame: allocation-free (scratch vectors) and skips the AudioParam writes when the head is still. */
+  /**
+   * Per frame, allocation-free: one world-matrix update, then position + forward (-Z) + up (+Y) read straight from
+   * the matrix columns. While IWSDK's three AudioListener (on the XR head) drives the shared context's listener, only
+   * the pose is cached (stereo fallback pans) — two writers would interleave their ramps a frame apart and wobble
+   * the HRTF image during head turns. Otherwise the AudioParams are written, skipping writes when the head is still.
+   */
   setListener(head: Object3D): void {
     const impl = this.impl;
     if (!impl || !head) return;
     try {
-      head.getWorldPosition(_pos);
-      head.getWorldQuaternion(_quat);
-      _fwd.set(0, 0, -1).applyQuaternion(_quat);
-      _up.set(0, 1, 0).applyQuaternion(_quat);
-      impl.setListenerPose(_pos.x, _pos.y, _pos.z, _fwd.x, _fwd.y, _fwd.z, _up.x, _up.y, _up.z);
+      head.updateWorldMatrix(true, false);
+      const m = head.matrixWorld.elements;
+      const ux = m[4], uy = m[5], uz = m[6];
+      const bx = m[8], by = m[9], bz = m[10];
+      const ul = Math.sqrt(ux * ux + uy * uy + uz * uz) || 1;
+      const bl = Math.sqrt(bx * bx + by * by + bz * bz) || 1;
+      const own = !this.threeListenerDrives(head);
+      this.owner = own ? 'engine' : 'three';
+      impl.setListenerPose(m[12], m[13], m[14], -bx / bl, -by / bl, -bz / bl, ux / ul, uy / ul, uz / ul, false, own);
     } catch (e) {
       warnOnce('setListener failed', e);
     }
   }
 
+  /** Is a three AudioListener on our context attached to the scene `head` lives in? (rescanned every 2 s) */
+  private threeListenerDrives(head: Object3D): boolean {
+    let root: Object3D = head;
+    while (root.parent) root = root.parent;
+    const now = performance.now();
+    if (root === this.scanRoot && now - this.listenerScanAt < LISTENER_SCAN_MS) return this.threeListener !== null;
+    this.scanRoot = root;
+    this.listenerScanAt = now;
+    this.threeListener = this.findListener(root);
+    return this.threeListener !== null;
+  }
+
+  private findListener(o: Object3D): Object3D | null {
+    if (o.type === 'AudioListener' && (o as Object3D & { context?: unknown }).context === this.ctx) return o;
+    const ch = o.children;
+    for (let i = 0; i < ch.length; i++) {
+      const hit = this.findListener(ch[i]);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
   setPaused(paused: boolean): void {
     this.paused = !!paused;
-    this.guard('setPaused', () => this.applyPause(this.paused));
+    this.guard('setPaused', () => this.applyPause(this.paused || this.hidden));
   }
 
   private applyPause(p: boolean): void {
@@ -400,7 +542,7 @@ class LiveAudioEngine implements AudioEngine {
       impl.setPauseGain(0, 0.2); // ramp to an exact 0, then suspend the whole audio thread (no CPU while paused)
       this.suspendTimer = setTimeout(() => {
         this.suspendTimer = null;
-        if (this.paused && ctx.state === 'running') ctx.suspend().catch(() => undefined);
+        if ((this.paused || this.hidden) && ctx.state === 'running') ctx.suspend().catch(() => undefined);
       }, 320);
     } else {
       impl.setPauseGain(1, 0.3);
@@ -409,7 +551,7 @@ class LiveAudioEngine implements AudioEngine {
   }
 
   setMasterVolume(v: number): void {
-    this.volume = Number.isFinite(v) ? v : 1;
+    this.volume = fin(v, 1);
     const impl = this.impl;
     if (impl) this.guard('setMasterVolume', () => impl.setMasterVolume(this.volume));
   }
@@ -445,6 +587,9 @@ class LiveAudioEngine implements AudioEngine {
     if (this.suspendTimer !== null) clearTimeout(this.suspendTimer);
     this.timer = null;
     this.suspendTimer = null;
+    this.disarmGestureRetry();
+    if (this.pageHooked && typeof document !== 'undefined') document.removeEventListener('visibilitychange', this.onVisibility);
+    this.pageHooked = false;
     try {
       this.analyser?.disconnect();
     } catch {
@@ -453,8 +598,13 @@ class LiveAudioEngine implements AudioEngine {
     this.analyser = null;
     this.impl?.dispose();
     this.impl = null;
+    this.threeListener = null;
+    this.scanRoot = null;
   }
 }
+
+/** Anything with x/y/z (three's Vector3 included): positions are read once, at call time. */
+type Vector3Like = P3;
 
 const registry = new WeakMap<AudioEngine, LiveAudioEngine>();
 
@@ -462,6 +612,11 @@ const registry = new WeakMap<AudioEngine, LiveAudioEngine>();
 export function createAudioEngine(): AudioEngine {
   const e = new LiveAudioEngine();
   registry.set(e, e);
+  try {
+    (globalThis as { __audio?: AudioDebug }).__audio = e.debug; // QA handle: the most recent engine
+  } catch {
+    /* frozen global: QA only */
+  }
   return e;
 }
 

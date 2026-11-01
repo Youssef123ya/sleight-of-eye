@@ -113,7 +113,8 @@ export function installDebugApi(d: DebugDeps): DebugApi & DebugExtras {
         lastCatch: runner.lastCatch,
         palmed: palmed ? palmed.id : null,
         palmedBy: palmed ? palmed.holder : null,
-        loaded: loaded ? `${loaded.id}->${loaded.into}` : null,
+        // Record<PropId, PropId> (contracts DebugApi) while something is loaded, else null
+        loaded: loaded ? { [loaded.id]: loaded.into } : null,
         lifted: lifted ? lifted.id : null,
         propModes,
         gazeTarget: gaze.targetId,
@@ -148,6 +149,9 @@ export function installDebugApi(d: DebugDeps): DebugApi & DebugExtras {
             eyeContact: w.eyeContact,
             flustered: attention.isFlustered(w.spec.id),
             look,
+            /** where the attention rule points the head (world), and the eye it looks from */
+            target: w.hasTarget ? r3(w.target) : null,
+            eye: r3(w.eye),
           };
         }),
         gadgets,
