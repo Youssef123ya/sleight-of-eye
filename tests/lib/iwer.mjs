@@ -430,10 +430,12 @@ export async function waitFrames(page, n = 2) {
  * frame arrives (so a game that calibrates its stage from the first head pose sees the seated eye). Attaches the
  * DemoDirector from /capture/director.js as window.__director and hides the IWER DevUI.
  * `enter`: 'auto' clicks a visible landing "Enter" button if the page has one, else accepts IWER's offered session.
+ * A visible button that is still disabled (the game's #enter-btn waits for isSessionSupported) is given up to
+ * `enterWaitMs` to enable, so the session starts from a real click (user activation: XR + audio unlock) like a player's.
  */
 export async function enterXR(
   page,
-  { fov = 60, head = DEFAULT_EYE, look, inputMode = 'hand', enter = 'auto', enterSelector, timeout = 40_000 } = {},
+  { fov = 60, head = DEFAULT_EYE, look, inputMode = 'hand', enter = 'auto', enterSelector, enterWaitMs = 15_000, timeout = 40_000 } = {},
 ) {
   const lookAtPt = look ?? [head[0], head[1], head[2] - 1];
   await withTimeout(page.evaluate(installQaLib), 10_000, 'install QA lib');
@@ -470,16 +472,22 @@ export async function enterXR(
       ? [enterSelector]
       : [
           'xpath=//*[@data-enter]',
-          'xpath=//*[@id="enter" or @id="enter-button" or @id="enterButton"]',
+          'xpath=//*[@id="enter" or @id="enter-btn" or @id="enter-button" or @id="enterButton"]',
           'xpath=//button[contains(translate(normalize-space(.), "ENTR", "entr"), "enter")]',
         ];
     for (const sel of selectors) {
       const btn = page.locator(sel).first();
-      if (await btn.isVisible({ timeout: 300 }).catch(() => false)) {
-        await btn.click({ timeout: 5000 }).catch(() => {});
-        via = `button ${sel}`;
-        break;
+      if (!(await btn.isVisible().catch(() => false))) continue;
+      const t0 = Date.now();
+      let enabled = await btn.isEnabled().catch(() => false);
+      while (!enabled && Date.now() - t0 < enterWaitMs) {
+        await sleep(100);
+        enabled = await btn.isEnabled().catch(() => false);
       }
+      if (!enabled) continue; // e.g. "VR headset needed": accept IWER's offered session instead
+      await btn.click({ timeout: 5000 }).catch(() => {});
+      via = `button ${sel}`;
+      break;
     }
   }
   const info = await qa(

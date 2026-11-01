@@ -11,15 +11,17 @@ import {
   CylinderGeometry,
   Mesh,
   PlaneGeometry,
-  ShaderMaterial,
   SphereGeometry,
   TorusGeometry,
   TubeGeometry,
   Vector3,
+  Vector4,
+  type ShaderMaterial,
 } from '@iwsdk/core';
 import { mergeParts } from '../art/geometry.js';
 import { PAL } from '../art/palette.js';
 import { MODE } from './glow.js';
+import { KIND, envShaderMaterial } from './shader.js';
 import { CELL, DECOR, WALLPAPER_PLAIN_UV } from './textures.js';
 import {
   BACK,
@@ -462,7 +464,10 @@ export function buildRoom(b: Buckets): RoomResult {
   return { blobs, glows, windowPane };
 }
 
-/** Deep-blue night: gradient sky, twinkling stars, a crescent moon, rooftops with warm windows, glass sheen. */
+/**
+ * Deep-blue night (gradient sky, twinkling stars, a crescent moon, rooftops with warm windows, glass sheen) for the
+ * window and the café door glass: one quad pair on the shared program (shader.ts nightSky). uClock.x = seconds.
+ */
 function makeNightPane(): Mesh<BufferGeometry, ShaderMaterial> {
   const w = WIN.x1 - WIN.x0;
   const h = WIN.y1 - WIN.y0;
@@ -479,66 +484,11 @@ function makeNightPane(): Mesh<BufferGeometry, ShaderMaterial> {
     ],
     { keepUv: true },
   );
-  const mat = new ShaderMaterial({
+  const mat = envShaderMaterial({
     name: 'env-night',
-    uniforms: { uTime: { value: 0 }, uAspect: { value: w / h } },
-    vertexShader: /* glsl */ `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }`,
-    fragmentShader: /* glsl */ `
-      uniform float uTime;
-      uniform float uAspect;
-      varying vec2 vUv;
-      float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
-      void main() {
-        vec2 uv = vUv;
-        vec2 p = vec2(uv.x * uAspect, uv.y);
-        // sky: deep navy at the top, glowing indigo near the rooftops
-        vec3 col = mix(vec3(0.05, 0.075, 0.32), vec3(0.008, 0.012, 0.075), smoothstep(0.12, 0.95, uv.y));
-        // moon (crescent) with a soft glow
-        vec2 mc = vec2(0.66 * uAspect, 0.8);
-        float dm = length(p - mc);
-        col += vec3(0.35, 0.42, 0.75) * exp(-dm * dm * 26.0) * 0.32;
-        float disk = 1.0 - smoothstep(0.066, 0.072, dm);
-        float bite = 1.0 - smoothstep(0.06, 0.066, length(p - mc - vec2(0.03, 0.022)));
-        col = mix(col, vec3(1.0, 0.96, 0.82), disk * (1.0 - bite));
-        // stars, each twinkling at its own rate
-        vec2 g = p * 34.0;
-        vec2 id = floor(g);
-        vec2 f = fract(g) - 0.5;
-        float hs = hash(id);
-        if (hs > 0.8) {
-          vec2 o = vec2(hash(id + 3.1), hash(id + 7.7)) - 0.5;
-          float d = length(f - o * 0.6);
-          float tw = 0.45 + 0.55 * sin(uTime * (1.2 + hs * 3.5) + hs * 40.0);
-          float star = (1.0 - smoothstep(0.0, 0.14, d)) * (hs - 0.8) * 5.0 * tw;
-          col += vec3(0.85, 0.9, 1.0) * star * smoothstep(0.25, 0.45, uv.y);
-        }
-        // rooftops: stepped silhouettes with chimneys and warm windows
-        float bx = floor(p.x * 7.0);
-        float bh = 0.1 + 0.2 * hash(vec2(bx, 2.0));
-        float roof = bh + 0.05 * (1.0 - abs(fract(p.x * 7.0) - 0.5) * 2.0) * step(0.5, hash(vec2(bx, 5.0)));
-        float chim = step(0.72, hash(vec2(bx, 9.0))) * step(abs(fract(p.x * 7.0) - 0.3), 0.06) * step(uv.y, roof + 0.05);
-        float building = max(step(uv.y, roof), chim);
-        vec3 bcol = vec3(0.012, 0.014, 0.04);
-        vec2 wg = vec2(p.x * 7.0 * 4.0, uv.y * 30.0);
-        vec2 wid = floor(wg);
-        vec2 wf = fract(wg);
-        float lit = step(0.7, hash(wid + bx));
-        float pulse = 0.75 + 0.25 * sin(uTime * 0.3 + hash(wid) * 30.0);
-        float win = lit * step(0.25, wf.x) * step(wf.x, 0.75) * step(0.3, wf.y) * step(wf.y, 0.8) * step(uv.y, bh - 0.025);
-        bcol += vec3(1.0, 0.62, 0.25) * win * 0.55 * pulse;
-        col = mix(col, bcol, building);
-        // a faint warm reflection of the café lamp on the glass + edge vignette
-        col += vec3(0.5, 0.3, 0.12) * exp(-((uv.x - 0.15) * (uv.x - 0.15) * 30.0 + (uv.y - 0.25) * (uv.y - 0.25) * 18.0)) * 0.08;
-        col *= 0.75 + 0.25 * smoothstep(0.0, 0.12, min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y)));
-        gl_FragColor = vec4(col, 1.0);
-        #include <colorspace_fragment>
-      }`,
-    toneMapped: false,
+    kind: KIND.night,
+    uniforms: { uClock: { value: new Vector4() }, uAspect: { value: w / h } },
+    depthWrite: true, // opaque look: alpha 1, writes depth (drawn in the transparent pass with the same pixels)
   });
   const m = new Mesh(geo, mat);
   m.name = 'env-nightWindow';

@@ -164,8 +164,8 @@ export async function createGame(world: World, opts: StartOptions = {}): Promise
   session = new SessionController(ctx, runner, attention, gaze, props, handTracker, landing, save);
   const sess = session;
 
-  // the 2D attract view: the opening act's audience on stage behind the landing page
-  runner.skipToIdle();
+  // the calm 2D attract view behind the landing page: Act I's kits idling on their seats, the coin on its mark
+  runner.attract();
 
   // ------------------------------------------------------------------------------------------ frame tick
   const reported = new Set<string>();

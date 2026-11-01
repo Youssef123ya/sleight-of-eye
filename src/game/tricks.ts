@@ -14,8 +14,9 @@ import type {
   Side,
   Spectator,
   SpectatorAnchor,
+  UI,
 } from '../contracts.js';
-import { L } from '../layout.js';
+import { L, type V3 } from '../layout.js';
 import { ACTS, ALL_ACTS, CATCH_LINE, FLUSTER_LINES, type ActDef, type BeatDef, type CastMember, type Line } from './acts.js';
 import type { Attention, Watcher } from './attention.js';
 import type { GazeTracker } from './gaze.js';
@@ -37,13 +38,23 @@ const BASE_DURATION: Record<GadgetId, number> = {
 };
 const LOOKBACK_HOLD = 0.35;
 /**
- * Rig-local height for flat sight cones: the café's velvet mat is 6 mm thick (props stand on its top, at the
- * L.propMarks height) while the puppets draw their cone at L.tableY + 4.5 mm, which hid it under the velvet
- * exactly where it matters. Lifted to just above the mat top (still below every prop's body).
+ * Rig-local height for flat sight cones that a spectator module draws UNDER the 6 mm velvet mat (L.mat.top), where
+ * the velvet hides them exactly where they matter: lifted to just above the mat top, still below every prop's body.
+ * A cone already drawn at or above the mat top is left alone.
  */
-const MAT_TOP = L.propMarks.coin[1];
-const CONE_Y = MAT_TOP + 0.0012;
+const CONE_Y = L.mat.top + 0.0012;
+/** The centre of the mat, on its top surface (fallback look target, the look-back gaze hint). */
+const MAT_SPOT: V3 = [L.mat.center[0], L.mat.top, L.mat.center[2]];
 const QUICK_REVEAL_S = 3.0;
+/** Lines kept for tests and the debug overlay (what was handed to audio.say). */
+const SAID_LOG = 12;
+/** Less of the music box's window than this left after a pause: the box is about to close, no new tune. */
+const MIN_TUNE_S = 1.0;
+/**
+ * A tune restarted after a pause asks for this share of the window left: the audio engine closes a finite melody
+ * with a ritardando, so its last note then still lands before the window ends (and its stop).
+ */
+const RESUME_TUNE_SHARE = 0.8;
 const ANCHORS: SpectatorAnchor[] = ['eyes', 'head', 'ear', 'hand', 'notebook', 'beak', 'hatTop'];
 /** fx/sfx options used from per-frame code (constants: nothing allocated per call). */
 const EAR_SPARKLE = { count: 3, scale: 0.6 } as const;
@@ -93,6 +104,10 @@ export class TrickRunner {
   rabbit: Spectator | null = null;
   /** The bow's newspaper review has been handed to the UI. */
   reviewShown = false;
+  /** The stage is the calm 2D attract view (before the first Enter, after every Exit): no show is running. */
+  attracting = false;
+  /** Last lines handed to audio.say, newest last (tests/debug). */
+  readonly said: string[] = [];
 
   private epoch = 0;
   private waiters: Waiter[] = [];
@@ -100,6 +115,8 @@ export class TrickRunner {
   private readonly dwellShown: Record<GadgetId, number> = { musicBox: 0, candle: 0, firework: 0 };
   private fuseLoop: { stop(): void } | null = null;
   private tickLoop: { stop(): void } | null = null;
+  /** The music-box melody while the gadget performs (Easy Audience: until its window closes). */
+  private musicBoxTune: { stop(): void } | null = null;
   private volunteer: Spectator | null = null;
   private liftSeen = false;
   private liftOk = false;
@@ -133,7 +150,7 @@ export class TrickRunner {
     this.gazeMarker = new Group();
     this.gazeMarker.name = 'lookback-target';
     ctx.rig.root.add(this.gazeMarker);
-    this.gazeMarker.position.set(L.mat.center[0], L.mat.center[1], L.mat.center[2]);
+    this.gazeMarker.position.set(MAT_SPOT[0], MAT_SPOT[1], MAT_SPOT[2]);
     // the firework's bang turns every free head
     const fw = ctx.cafe.gadgets.firework;
     if (fw) fw.onBurst = () => this.onFireworkBurst();
@@ -169,20 +186,103 @@ export class TrickRunner {
     return this.actDef.beats[this.beat] ?? null;
   }
 
-  /** Start the show (first stable XR frames) — optionally resuming an autosaved act/beat. */
-  begin(act = 1, beat = 0): void {
+  /**
+   * Start the show (first stable XR frames of every session), resuming an autosaved act/checkpoint. Acts finished
+   * before the save keep their stars (`savedStars`) so the review at the bow is right; a save at the bow (or a
+   * broken one) starts tonight's show over.
+   */
+  begin(act = 1, beat = 0, savedStars?: readonly number[]): void {
+    let a = Math.round(act);
+    let b = Math.max(0, Math.round(beat) || 0);
     this.started = true;
     this.running = true;
-    void this.startAct(Math.max(1, Math.min(4, act)), beat, false);
+    if (!(a >= 1 && a <= ACTS.length)) {
+      a = 1;
+      b = 0;
+      this.stars[0] = this.stars[1] = this.stars[2] = 0;
+      this.caughtTotal = 0;
+      this.d.hints.forget();
+    } else if (savedStars) {
+      for (let i = 0; i < this.stars.length; i++) {
+        const s = Number(savedStars[i]);
+        this.stars[i] = i < a - 1 && Number.isFinite(s) ? Math.max(0, Math.min(3, Math.round(s))) : 0;
+      }
+    }
+    void this.startAct(a, b, false);
   }
 
-  /** Before the show: Act I's cast and coin on stage (the 2D attract view behind the landing page). */
-  skipToIdle(): void {
+  /**
+   * The calm 2D attract view behind the landing page — before the first Enter and after every Exit: Act I's kits
+   * idle on their seats glancing around, the coin on its mark, the gadgets at rest; no newspaper, hints, glints,
+   * cones, captions, sound loops or pending beat sequences. The show resumes from the autosave on the next Enter.
+   */
+  attract(): void {
+    const { ctx, attention, hints, gaze } = this.d;
+    ++this.epoch; // cancels every pending sequence: lines, hops, act transitions, rewinds, the bow's review
+    this.waiters.length = 0; // … and drops their timers: nothing waits on them any more
+    this.started = false;
+    this.running = false;
+    this.attracting = true;
+    this.phase = 'idle';
+    hints.clear();
+    this.safe(() => ctx.ui.clearHints());
+    this.removeRevealTargets();
+    this.stopLoops();
+    this.reviewShown = false;
+    this.safe(() => ctx.ui.review(null));
+    // not in the UI contract: captions otherwise fade out on their own within ~2 s
+    const ui = ctx.ui as UI & { clearCaptions?: () => void };
+    if (typeof ui.clearCaptions === 'function') this.safe(() => ui.clearCaptions?.());
     this.actDef = ACTS[0];
     this.act = 0;
     this.beat = 0;
-    this.phase = 'idle';
-    this.setupAct(ACTS[0], 0);
+    this.setupAct(ACTS[0], 0); // Act I's cast on its seats (a volunteer still on the mat hops home), coin on its mark
+    attention.alarmId = null;
+    attention.conesVisible = false;
+    attention.glyphsVisible = false;
+    attention.demoConeId = null;
+    attention.setIdle(true);
+    gaze.spotlightEnabled = false;
+    const r = this.rabbit;
+    if (r) {
+      this.safe(() => void r.react('idle').catch(() => {}));
+      this.safe(() => r.lookAt(null));
+    }
+  }
+
+  /** The show takes the stage back from the attract view (rules drive the audience, the gaze spotlight returns). */
+  private leaveAttract(): void {
+    if (!this.attracting) return;
+    this.attracting = false;
+    this.d.attention.setIdle(false);
+    this.d.gaze.spotlightEnabled = true;
+  }
+
+  /**
+   * The session paused (or froze for "Hold it!"): the gadgets stand still, so the music box falls silent too, and
+   * picks its tune up again for whatever is left of its window when the show goes on.
+   */
+  setHeld(held: boolean): void {
+    if (held) {
+      this.stopMusicBox();
+      return;
+    }
+    if (!this.started || this.musicBoxTune || !this.gadgetActive.musicBox) return;
+    const g = this.d.ctx.cafe.gadgets.musicBox;
+    if (!g) return;
+    let left = 0;
+    try {
+      if (!g.isActive()) return;
+      left = Number.isFinite(g.duration) ? g.progress() * g.duration : Infinity;
+    } catch {
+      return;
+    }
+    if (left >= MIN_TUNE_S) this.playMusicBox(g, left * RESUME_TUNE_SHARE); // Infinity stays Infinity
+  }
+
+  /** A music-box melody is playing (tests/debug). */
+  get musicBoxPlaying(): boolean {
+    return this.musicBoxTune !== null;
   }
 
   /** Debug/QA: jump straight to an act/beat (props, cast and gadgets set up to match). */
@@ -292,6 +392,7 @@ export class TrickRunner {
   private async startAct(n: number, beatIndex: number, instant: boolean): Promise<void> {
     const my = ++this.epoch;
     const { ui } = this.d.ctx;
+    this.leaveAttract();
     this.phase = 'transition';
     this.d.hints.clear();
     this.removeRevealTargets();
@@ -395,6 +496,12 @@ export class TrickRunner {
 
     props.clearGlints();
     this.applyGadgetAvailability(def);
+    // the music box plays for the beats that can use it (steal → load share it): once the move is done its tune
+    // stops and the box closes, so it never runs on under the look-back gasp or the reveal
+    if (this.gadgetActive.musicBox && !(def.gadgets && def.gadgets.indexOf('musicBox') >= 0)) {
+      this.stopMusicBox();
+      this.windDown('musicBox');
+    }
     attention.alarmId = null;
     attention.conesVisible = def.kind === 'steal' || def.kind === 'load';
     attention.glyphsVisible =
@@ -577,7 +684,7 @@ export class TrickRunner {
     this.d.hints.clear();
     const spot = this.tmp;
     if (def.prop) this.d.props.homeWorld(def.prop, spot);
-    else ctx.rig.toWorld(L.mat.center, spot);
+    else ctx.rig.toWorld(MAT_SPOT, spot);
     attention.focusAll(spot, 2.4);
     this.forLineup((s, i) => this.later(0.12 + 0.14 * i, my, () => void s.react('gasp').catch(() => {})));
     this.safe(() => ctx.audio.crowd('gasp', 0.9, spot));
@@ -600,7 +707,7 @@ export class TrickRunner {
       }
       this.phase = 'prep';
       const my = this.epoch;
-      void this.hopToVolunteer(spec).then(() => {
+      void this.hopToVolunteer(spec, my).then(() => {
         if (my !== this.epoch) return;
         this.revealReady(def);
       });
@@ -931,10 +1038,14 @@ export class TrickRunner {
     this.safe(() => by.getEyeWorldPosition(at));
     attention.alarmId = by.id;
     attention.conesVisible = true;
+    // the record-scratch sting cuts the music box off, and the box shuts (the rewind re-arms it)
+    this.stopMusicBox();
+    this.windDown('musicBox');
     this.safe(() => void by.react('pointSqueak', { target: point.clone(), intensity: 1 }).catch(() => {}));
     this.safe(() => ui.caption(CATCH_LINE, this.anchor(by, 'head'), { seconds: CFG.catchCaptionTime, style: 'shout' }));
     this.safe(() => audio.sfx('catch', { at }));
-    this.safe(() => audio.say('I saw that!', { at, voice: by.kind, mood: 'accusing' }));
+    // animalese shouts capitals: the line goes to the voice exactly as captioned ("I SAW THAT!")
+    this.say(CATCH_LINE, at, by.kind, 'accusing');
     this.safe(() => fx.burst('catchFlash', point, { scale: 1 }));
     this.later(0.35, my, () => audio.crowd('giggle', 0.7, at));
     let k = 0;
@@ -959,8 +1070,9 @@ export class TrickRunner {
     this.resetGadgets();
     attention.reset();
     for (const s of this.lineup) this.safe(() => void s.react('idle').catch(() => {}));
-    // a volunteer that already hopped down goes straight back to its seat
+    // a volunteer that already hopped down (or is still in the air) goes straight back to its seat
     if (this.volunteer) this.seatInstantly(this.volunteer);
+    if (this.away.size) for (const s of [...this.away]) this.seatInstantly(s);
     this.enterBeat(beatIndex);
   }
 
@@ -1025,7 +1137,8 @@ export class TrickRunner {
     this.safe(() => {
       if (id === 'musicBox') {
         audio.sfx('musicBoxWind', { at });
-        audio.musicBox(at, easy ? 30 : g.duration);
+        // as long as the box performs (Easy Audience: Infinity, stopped when its window closes)
+        this.playMusicBox(g, g.duration);
       } else if (id === 'candle') {
         audio.sfx('flare', { at });
       } else {
@@ -1068,6 +1181,7 @@ export class TrickRunner {
       }
       if (this.gadgetActive[id] && !active) {
         this.gadgetActive[id] = false;
+        if (id === 'musicBox') this.stopMusicBox(); // the tune ends with the box's performance
         this.d.ctx.events.emit('gadget:ended', { gadget: id });
         this.safe(() => g.setUsed(true));
         this.safe(() => g.setAvailable(false));
@@ -1118,7 +1232,47 @@ export class TrickRunner {
     const gadgets = this.d.ctx.cafe.gadgets;
     for (const id of GADGET_IDS) {
       const g = gadgets[id];
-      if (g && this.gadgetActive[id] && !Number.isFinite(g.duration)) g.duration = 0.05;
+      if (g && this.gadgetActive[id] && !Number.isFinite(g.duration)) {
+        g.duration = 0.05;
+        if (id === 'musicBox') this.stopMusicBox();
+      }
+    }
+  }
+
+  /** Close an active gadget's window now: it winds down gracefully on its next update (the rewind re-arms it). */
+  private windDown(id: GadgetId): void {
+    const g = this.d.ctx.cafe.gadgets[id];
+    if (!g || !this.gadgetActive[id]) return;
+    try {
+      if (g.isActive()) g.duration = 0.05;
+    } catch {
+      /* the rewind resets it anyway */
+    }
+  }
+
+  /** The music-box melody for `seconds` (Infinity = until stopped), keeping its stop handle. Event-time only. */
+  private playMusicBox(g: Gadget, seconds: number): void {
+    this.stopMusicBox();
+    worldPos(g.focus, this.tuneAt);
+    try {
+      const h = this.d.ctx.audio.musicBox(this.tuneAt, seconds) as { stop?: () => void } | null | undefined;
+      // an engine without the stop handle returns nothing: its melody then just runs its length
+      this.musicBoxTune = h && typeof h.stop === 'function' ? (h as { stop(): void }) : null;
+    } catch (e) {
+      this.musicBoxTune = null;
+      console.warn('[tricks] music box failed', e);
+    }
+  }
+  private readonly tuneAt = new Vector3();
+
+  private stopMusicBox(): void {
+    const h = this.musicBoxTune;
+    if (!h) return;
+    this.musicBoxTune = null;
+    try {
+      h.stop();
+    } catch (e) {
+      console.warn('[tricks] music box stop failed', e);
     }
   }
 
@@ -1280,14 +1434,14 @@ export class TrickRunner {
     }
   }
 
-  private async hopToVolunteer(spec: Spectator): Promise<void> {
+  private async hopToVolunteer(spec: Spectator, my: number): Promise<void> {
     const { cafe } = this.d.ctx;
     const spot = cafe.volunteerSpot;
     const target = worldPosNow(spot, new Vector3());
-    // the spot is on the velvet mat: land on its top (L.volunteerSpot assumes a thinner mat)
+    // the spot is on the 6 mm velvet mat: the feet land on its top (L.mat.top), never inside the velvet
     this.frame.toLocal(target, this.tmp);
-    if (this.tmp.y < MAT_TOP) {
-      this.tmp.y = MAT_TOP;
+    if (this.tmp.y < L.mat.top) {
+      this.tmp.y = L.mat.top;
       this.frame.toWorld(this.tmp, target);
     }
     const before = worldPosNow(spec.root, new Vector3());
@@ -1297,6 +1451,8 @@ export class TrickRunner {
     this.d.attention.pin(spec.id, 'player');
     this.away.add(spec);
     await this.within(spec.react('hopToVolunteer', { target: target.clone() }), 1.8);
+    // torn down mid-hop (Retry, Exit): whoever reset the stage has already sent it home
+    if (my !== this.epoch) return;
     this.volunteer = spec;
     this.placeAfterHop(spec, spot, before, eyesBefore);
   }
@@ -1305,11 +1461,13 @@ export class TrickRunner {
     const seatIndex = this.actDef.cast.find((c) => c.id === spec.id)?.seat ?? 0;
     const seat = this.d.ctx.cafe.seats[seatIndex];
     if (!seat) return;
+    const my = this.epoch;
     const target = worldPosNow(seat, new Vector3());
     const before = worldPosNow(spec.root, new Vector3());
     const eyesBefore = this.eyesOf(spec, new Vector3());
     this.safe(() => this.d.ctx.audio.sfx('hop', { at: before }));
     await this.within(spec.react('hopBack', { target: target.clone() }), 1.8);
+    if (my !== this.epoch) return; // the stage was reset meanwhile (Exit): it owns the spectator now
     this.placeAfterHop(spec, seat, before, eyesBefore);
     this.away.delete(spec);
     this.d.attention.unpin(spec.id);
@@ -1340,7 +1498,11 @@ export class TrickRunner {
     }
   }
 
-  /** Lift a flat sight cone lying on the tabletop so the 6 mm velvet mat no longer hides it (once per spectator). */
+  /**
+   * Lift a flat sight cone drawn on the cloth UNDER the 6 mm velvet mat (L.mat.top) so the velvet no longer hides
+   * it (once per spectator). A cone the spectator module already draws at or above the mat top — or one hanging
+   * from the eyes — is left exactly as it is.
+   */
   private liftCone(s: Spectator): void {
     if (this.coneLifted.has(s)) return;
     const cone = s.root.getObjectByName(`${s.id}-cone`);
@@ -1349,10 +1511,9 @@ export class TrickRunner {
     this.coneLifted.add(s);
     refreshWorld(cone);
     this.frame.toLocal(worldPos(cone, this.tmp), this.tmp2);
-    // only a flat cone drawn on the cloth (a cone hanging from the eyes needs nothing)
-    if (Math.abs(this.tmp2.y - L.tableY) > 0.012) return;
-    const dy = CONE_Y - this.tmp2.y;
-    if (dy > 0) cone.position.y += dy;
+    const y = this.tmp2.y;
+    if (y >= L.mat.top || y < L.tableY - 0.012) return; // above the velvet already / not a cloth cone
+    cone.position.y += CONE_Y - y;
   }
   private readonly coneLifted = new WeakSet<Spectator>();
 
@@ -1411,13 +1572,20 @@ export class TrickRunner {
   private speak(line: Line): void {
     const spec = this.resolveSpeaker(line.who);
     if (!spec || !spec.root.visible) return;
-    const { audio, ui, settings } = this.d.ctx;
+    const { ui, settings } = this.d.ctx;
     const at = new Vector3();
     this.safe(() => spec.getEyeWorldPosition(at));
-    this.safe(() => audio.say(line.text, { at, voice: spec.kind, mood: line.mood }));
+    this.say(line.text, at, spec.kind, line.mood);
     if (settings.peek().captions && !line.silent) {
       this.safe(() => ui.caption(line.text, this.anchor(spec, 'head'), { seconds: 2.4, style: 'speech' }));
     }
+  }
+
+  /** Animalese for a line (capital letters are shouted, so lines keep their authored case). */
+  private say(text: string, at: Vector3, voice: Spectator['kind'], mood: Mood | undefined): void {
+    this.said.push(`${voice}: ${text}`);
+    if (this.said.length > SAID_LOG) this.said.splice(0, this.said.length - SAID_LOG);
+    this.safe(() => this.d.ctx.audio.say(text, { at, voice, mood }));
   }
 
   private resolveSpeaker(who: string): Spectator | null {
@@ -1450,7 +1618,7 @@ export class TrickRunner {
       const m = props.mode(id);
       if (m === 'palmed' || m === 'loaded' || m === 'hidden') props.homeWorld(id, attention.matFocus);
       else props.centerWorld(id, attention.matFocus);
-    } else this.frame.toWorld(L.mat.center, attention.matFocus);
+    } else this.frame.toWorld(MAT_SPOT, attention.matFocus);
   }
 
   private propRoot(id: PropId): Object3D | null {
@@ -1471,6 +1639,7 @@ export class TrickRunner {
     this.fuseLoop?.stop();
     this.fuseLoop = null;
     this.stopTick();
+    this.stopMusicBox();
   }
 
   /** Resolve after `seconds` of runner time (pauses with the game). */

@@ -2,7 +2,9 @@
 //   &show=cycle (default: a 26 s loop through spotlight, captions, hints, plaque hover/press, banner, curtain,
 //          title card, rewind smear, review) | all (everything that can share the stage at once) | captions |
 //          hints | plaques | banner | curtain | review | posters | none (plaques + posters + spotlight only)
-//   &landing=1        mount + show the landing page overlay (add &xr=0 for the "open in Quest" notice)
+//   &landing=1        mount + show the landing page overlay (add &xr=0 for the "open in Quest" notice); XR-only UI
+//                     (plaques, hints, banner, spotlight, captions, title card, rewind) hides in 2D as in the game
+//                     (&hide2d=1 forces that alone)
 //   &hands=1          poke plaques with real (emulated) fingertips
 //   &baseline=1       stand-in scene only (no UI) — for draw-call accounting
 // window.__uiDemo.trigger('title' | 'curtain-close' | 'curtain-open' | 'rewind' | 'review' | 'banner' |
@@ -293,6 +295,10 @@ export default async function uiDemo(world: World): Promise<void> {
   const pokes = new DemoPokes();
   const gazeTargets = new DemoGaze();
   const ui = (await uiFactory.build(world, rig, { pokes, gazeTargets, events, cafe: null })) as GameUI;
+  // the game hides XR-only UI (plaques, hints, banner, spotlight, captions, title card, rewind) behind the 2D landing
+  // page; the demo shows it in a plain browser too, unless it previews the landing page (&landing=1) — or &hide2d=1
+  // forces the game behaviour
+  ui.autoHide2D = params.get('landing') === '1' || params.get('hide2d') === '1';
 
   const actions: PlaqueAction[] = ['retry', 'easy', 'assist', 'recenter', 'exit'];
   const toggles = { easy: false, assist: false };

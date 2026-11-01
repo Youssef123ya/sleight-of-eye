@@ -635,105 +635,311 @@ const MB_A_BARS = [CH.F, CH.C7, CH.GmC7, CH.F];
 const MB_B_BARS = [CH.F, CH.Dm, CH.C7, CH.F];
 const MB_BEAT = 0.4; // 150 BPM
 
+const MB_PHRASE = 12; // beats: 4 bars of 3/4
+/** How long a tine rings (its envelope lands on exactly 0): melody / accompaniment. */
+const MB_RING = 2.4;
+const MB_RING_ACC = 1.7;
+/** The café trio steps back while the box plays. */
+const MB_DUCK = 0.4;
+/** stop(): the lid closes — the box's own output is damped to exactly 0 over this long. */
+export const MB_STOP_FADE = 0.12;
+/** Never faster than this: a shorter fade of a ringing tine can click. */
+export const MB_STOP_MIN = 0.03;
+
 interface MbEvent {
-  t: number;
+  /** Beat from the start of the show (multiples of 0.5). */
+  beat: number;
   midi: number;
   amp: number;
   melody: boolean;
 }
 
-/** Plays the music box progressively from the scheduler; the final phrase slows like a spring running down. */
+/**
+ * Plays the music box progressively from the scheduler, one phrase at a time (A, B, A, … — every phrase resolves
+ * on the tonic). A finite show ends with whole phrases and a ritardando like a spring running down; `seconds =
+ * Infinity` plays until `stop()`. Every tine is its own little node bag that tears itself down when it has rung out
+ * (an endless box holds ~15 of them at a time, never a growing pile), and holds the voice slot open meanwhile.
+ * `stop()` (idempotent) fades the box's output to exactly 0 over >= 30 ms, then stops whatever still rings or is
+ * already scheduled inside the lookahead window, so the voice, its panner and the music duck are released at once.
+ */
 export class MusicBoxTrack implements Track {
+  /** Seconds from the first tine until the last one has rung out (Infinity: endless, until stop()). */
   readonly duration: number;
+  readonly endless: boolean;
+  /** Called once when the box stops scheduling notes (natural end, stop(), stolen voice, error). */
+  onEnd: (() => void) | null = null;
+  private readonly t0: number;
+  private readonly phrases: number;
+  private readonly totalBeats: number;
+  /** Finite shows: half-beat index → seconds after t0, with the closing ritardando. Null when endless. */
+  private readonly warp: Float64Array | null;
+  /** The box's own output (into the voice): stop() fades this, never the pooled slot's gain. */
+  private readonly bus: GainNode;
+  private readonly serial: number;
+  /** Notes of the phrase being played (objects reused phrase after phrase), first `count` valid. */
   private readonly events: MbEvent[] = [];
+  private count = 0;
   private idx = 0;
+  private phrase = 0;
+  /** Tines still ringing (or scheduled inside the lookahead window). */
+  private readonly live: NodeBag[] = [];
   /** Seconds the remaining timeline has slid after main-thread stalls. */
   private slip = 0;
+  private lastT = 0;
   private released = false;
-  private readonly serial: number;
+  private ducked = false;
+  private stopped = false;
+  private ended = false;
 
   constructor(
     private readonly ev: Ev,
     seconds: number,
   ) {
     this.serial = ev.bag.serial;
-    const phrases = Math.max(1, Math.round(seconds / (12 * MB_BEAT)));
-    // whole phrases (they resolve on the tonic), but never longer than asked: a 2 s show plays 5 beats
-    const totalBeats = Math.min(phrases * 12, Math.max(3, Math.round(seconds / MB_BEAT)));
-    // time warp: the last ~5 beats stretch up to 1.6x (ritardando)
-    const warp = new Float64Array(totalBeats * 2 + 1);
-    for (let j = 1; j < warp.length; j++) {
-      const mid = (j - 0.5) / 2;
-      const x = clamp((mid - (totalBeats - 5.5)) / 4.5, 0, 1);
-      warp[j] = warp[j - 1] + 0.5 * MB_BEAT * (1 + 0.6 * x * x);
-    }
-    const at = (beat: number): number => ev.t + warp[Math.round(clamp(beat, 0, totalBeats) * 2)];
-    for (let p = 0; p < phrases; p++) {
-      const mel = p % 2 === 0 ? MB_A : MB_B;
-      const bars = p % 2 === 0 ? MB_A_BARS : MB_B_BARS;
-      const b0 = p * 12;
-      for (const [beat, midi] of mel) this.events.push({ t: at(b0 + beat), midi, amp: 0.3, melody: true });
-      for (let bar = 0; bar < 4; bar++) {
-        if (p === phrases - 1 && bar === 3) {
-          // final bar: just the tonic underneath the last melody note
-          this.events.push({ t: at(b0 + 9), midi: 65, amp: 0.15, melody: false });
-          this.events.push({ t: at(b0 + 9), midi: 69, amp: 0.09, melody: false });
-          continue;
-        }
-        const ch = bars[bar];
-        for (let beat = 0; beat < 3; beat++) {
-          for (const m of ch[beat]) this.events.push({ t: at(b0 + bar * 3 + beat), midi: m, amp: beat === 0 ? 0.15 : 0.08, melody: false });
-        }
+    this.t0 = ev.t;
+    this.endless = !Number.isFinite(seconds);
+    if (this.endless) {
+      this.phrases = Infinity;
+      this.totalBeats = Infinity;
+      this.warp = null;
+      this.duration = Infinity;
+    } else {
+      const phrases = Math.max(1, Math.round(seconds / (MB_PHRASE * MB_BEAT)));
+      // whole phrases (they resolve on the tonic), but never longer than asked: a 2 s show plays 5 beats
+      const totalBeats = Math.min(phrases * MB_PHRASE, Math.max(3, Math.round(seconds / MB_BEAT)));
+      // time warp: the last ~5 beats stretch up to 1.6x (ritardando)
+      const warp = new Float64Array(totalBeats * 2 + 1);
+      for (let j = 1; j < warp.length; j++) {
+        const mid = (j - 0.5) / 2;
+        const x = clamp((mid - (totalBeats - 5.5)) / 4.5, 0, 1);
+        warp[j] = warp[j - 1] + 0.5 * MB_BEAT * (1 + 0.6 * x * x);
       }
+      this.phrases = phrases;
+      this.totalBeats = totalBeats;
+      this.warp = warp;
+      // the last note of the show (a peek at the final phrase; the play-through regenerates it)
+      this.fill(phrases - 1);
+      let last = 0;
+      for (let i = 0; i < this.count; i++) last = Math.max(last, this.events[i].beat);
+      this.count = 0;
+      this.duration = warp[Math.round(last * 2)] + MB_RING;
     }
-    // drop anything past a shortened show (at() clamps beyond the end, so compare in beats)
-    const lastT = at(totalBeats - 0.5);
-    for (let i = this.events.length - 1; i >= 0; i--) if (this.events[i].t > lastT + 1e-6) this.events.splice(i, 1);
-    this.events.sort((a, b) => a.t - b.t);
-    this.duration = (this.events.length ? this.events[this.events.length - 1].t - ev.t : 0) + 2.4;
-    ev.bag.hold(); // keep the voice alive between notes
+    this.bus = ev.gain(1, ev.out);
+    ev.bag.hold(); // keep the voice alive between notes (each ringing tine holds it too)
+    ev.core.holdDuck(MB_DUCK, ev.t); // last: nothing after this can throw and leak the hold
+    this.ducked = true;
+  }
+
+  /** Tines currently ringing (QA: an endless box must not pile them up). */
+  get ringing(): number {
+    return this.live.length;
+  }
+
+  /** Still scheduling notes (not stopped, not finished, voice not stolen). */
+  get playing(): boolean {
+    return !this.ended;
   }
 
   pump(until: number): boolean {
-    if (this.ev.bag.done || this.ev.bag.serial !== this.serial) return true; // the voice was stolen
-    if (this.idx < this.events.length) {
-      const now = this.ev.ctx.currentTime;
-      const next = this.events[this.idx].t + this.slip;
+    if (this.stopped || this.ended) return true;
+    const voice = this.ev.bag;
+    const now = this.ev.ctx.currentTime;
+    if (voice.done || voice.serial !== this.serial) {
+      // the voice was stolen (its gain is already fading out over 15 ms) or the engine went away
+      this.silence(now + 0.02);
+      this.end(now);
+      return true;
+    }
+    let e = this.peek();
+    if (e) {
+      const next = this.timeOf(e.beat) + this.slip;
       // main thread stalled: the box hesitates like a sticky comb instead of starting tines mid-envelope
       if (next < now + LEAD * 0.5) this.slip += now + LEAD - next;
     }
-    while (this.idx < this.events.length && this.events[this.idx].t + this.slip < until) {
-      const e = this.events[this.idx++];
-      this.tine(e, e.t + this.slip);
+    // never more than 2 s ahead, whatever `until` says (a NaN or huge horizon must not flood the graph)
+    const horizon = until < now + 2 ? until : now + 2;
+    let guard = 0;
+    while (e && guard++ < 128) {
+      const t = this.timeOf(e.beat) + this.slip;
+      if (!(t < horizon)) break;
+      this.idx++;
+      this.tine(e, t);
+      this.lastT = t;
+      e = this.peek();
     }
-    if (this.idx >= this.events.length) {
-      this.released = true;
-      this.ev.bag.unhold();
+    if (!e) {
+      this.end(this.lastT + 0.8); // every tine is scheduled: the trio comes back up as the last one rings out
       return true;
     }
     return false;
   }
 
   abort(): void {
-    if (this.released || this.ev.bag.done || this.ev.bag.serial !== this.serial) return;
-    this.released = true;
-    this.ev.bag.unhold(); // the voice ends when the tines already scheduled have rung out
+    this.end(this.ev.ctx.currentTime); // the tines already scheduled ring out
+  }
+
+  /** Close the lid: fade to exactly 0 (>= 30 ms), stop everything that rings, release voice + duck. Idempotent. */
+  stop(fade = MB_STOP_FADE): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    const core = this.ev.core;
+    core.removeTrack(this);
+    const voice = this.ev.bag;
+    const now = this.ev.ctx.currentTime;
+    if (!voice.done && voice.serial === this.serial) {
+      const f = Math.max(MB_STOP_MIN, Number.isFinite(fade) ? fade : MB_STOP_FADE);
+      // A damper, not a ramp: exponential decay (tau f/6), continued analytically, then a short linear glide to a true
+      // zero at f. A linear fade still carries ~8% of the signal into its last 10 ms, and Chrome cuts the HRTF panner's
+      // convolution tail ~10 ms after its input falls silent: measured offline, that cut was a -60..-80 dBFS step;
+      // this shape leaves ~26 dB less signal in the tail.
+      const p = this.bus.gain;
+      const v0 = p.value;
+      const tau = f / 6;
+      const e1 = now + f - Math.min(0.012, f / 3);
+      hold(p, now);
+      p.setTargetAtTime(0, now, tau);
+      p.setValueAtTime(v0 * Math.exp(-(e1 - now) / tau), e1);
+      p.linearRampToValueAtTime(0, now + f);
+      // sources end once the output is silent; tines due later inside the lookahead window never start
+      this.silence(now + f + 0.005);
+    }
+    this.end(now);
+  }
+
+  // ----------------------------------------------------------------------------------------------- notes
+
+  /** The next note to play, moving on to the next phrase when this one is spent; null when the show is over. */
+  private peek(): MbEvent | null {
+    while (this.idx >= this.count) {
+      if (this.phrase >= this.phrases) return null;
+      this.fill(this.phrase++);
+    }
+    return this.events[this.idx];
+  }
+
+  /** Load phrase `p` (beats 12p … 12p+11) into `events`, in time order. Allocation-free after the first phrases. */
+  private fill(p: number): void {
+    const final = p === this.phrases - 1; // never for an endless box
+    const mel = p % 2 === 0 ? MB_A : MB_B;
+    const bars = p % 2 === 0 ? MB_A_BARS : MB_B_BARS;
+    const b0 = p * MB_PHRASE;
+    let n = 0;
+    for (let i = 0; i < mel.length; i++) n = this.put(n, b0 + mel[i][0], mel[i][1], 0.3, true);
+    for (let bar = 0; bar < 4; bar++) {
+      if (final && bar === 3) {
+        // final bar: just the tonic underneath the last melody note
+        n = this.put(n, b0 + 9, 65, 0.15, false);
+        n = this.put(n, b0 + 9, 69, 0.09, false);
+        continue;
+      }
+      const ch = bars[bar];
+      for (let beat = 0; beat < 3; beat++) {
+        const notes = ch[beat];
+        for (let k = 0; k < notes.length; k++) n = this.put(n, b0 + bar * 3 + beat, notes[k], beat === 0 ? 0.15 : 0.08, false);
+      }
+    }
+    // stable insertion sort by beat: a chord under a melody note keeps the melody first
+    const ev = this.events;
+    for (let i = 1; i < n; i++) {
+      const x = ev[i];
+      let j = i - 1;
+      while (j >= 0 && ev[j].beat > x.beat) {
+        ev[j + 1] = ev[j];
+        j--;
+      }
+      ev[j + 1] = x;
+    }
+    this.count = n;
+    this.idx = 0;
+  }
+
+  /** Append a note unless it falls past a shortened show; returns the new count. */
+  private put(n: number, beat: number, midi: number, amp: number, melody: boolean): number {
+    if (beat > this.totalBeats - 0.5) return n;
+    let e = this.events[n];
+    if (!e) {
+      e = { beat: 0, midi: 0, amp: 0, melody: false };
+      this.events[n] = e;
+    }
+    e.beat = beat;
+    e.midi = midi;
+    e.amp = amp;
+    e.melody = melody;
+    return n + 1;
+  }
+
+  private timeOf(beat: number): number {
+    const w = this.warp;
+    return this.t0 + (w ? w[Math.round(beat * 2)] : beat * MB_BEAT);
   }
 
   /** A comb tine: bright sine with a fast-decaying inharmonic overtone (the "tink" of the pin). */
   private tine(e: MbEvent, t: number): void {
-    const ev = this.ev;
-    const f = ev.hz(midiHz(e.midi));
-    const g = ev.gain(0, ev.out);
-    const e1 = envAD(g.gain, t, e.amp, MIN_RAMP, e.melody ? 0.42 : 0.3, t + (e.melody ? 2.4 : 1.7));
-    ev.osc('sine', f, t, e1 + 0.01, g);
-    if (e.melody) {
-      const g2 = ev.gain(0, ev.out);
-      const e2 = envAD(g2.gain, t, e.amp * 0.28, MIN_RAMP, 0.03, t + 0.25);
-      ev.osc('sine', ev.safe(f * 6.27), t, e2 + 0.01, g2);
-      const g3 = ev.gain(0, ev.out);
-      const e3 = envAD(g3.gain, t, e.amp * 0.12, MIN_RAMP, 0.12, t + 0.9);
-      ev.osc('sine', ev.safe(f * 2), t, e3 + 0.01, g3);
+    const voice = this.ev.bag;
+    const f = this.ev.hz(midiHz(e.midi));
+    const ev = this.ev.core.loose(this.bus, t); // its own bag: torn down as soon as this tine has rung out
+    const bag = ev.bag;
+    voice.hold();
+    this.live.push(bag);
+    bag.onFinish = () => this.tineDone(bag);
+    try {
+      const g = ev.gain(0, ev.out);
+      const e1 = envAD(g.gain, t, e.amp, MIN_RAMP, e.melody ? 0.42 : 0.3, t + (e.melody ? MB_RING : MB_RING_ACC));
+      ev.osc('sine', f, t, e1 + 0.01, g);
+      if (e.melody) {
+        const g2 = ev.gain(0, ev.out);
+        const e2 = envAD(g2.gain, t, e.amp * 0.28, MIN_RAMP, 0.03, t + 0.25);
+        ev.osc('sine', ev.safe(f * 6.27), t, e2 + 0.01, g2);
+        const g3 = ev.gain(0, ev.out);
+        const e3 = envAD(g3.gain, t, e.amp * 0.12, MIN_RAMP, 0.12, t + 0.9);
+        ev.osc('sine', ev.safe(f * 2), t, e3 + 0.01, g3);
+      }
+    } catch (err) {
+      bag.finish(); // gives the voice hold back
+      throw err;
+    }
+  }
+
+  private tineDone(bag: NodeBag): void {
+    const i = this.live.indexOf(bag);
+    if (i >= 0) {
+      this.live[i] = this.live[this.live.length - 1];
+      this.live.pop();
+    }
+    const voice = this.ev.bag;
+    if (voice.serial === this.serial) voice.unhold(); // the voice ends with the last tine
+  }
+
+  /** Stop every tine that still rings (or has not started yet) at `at`. */
+  private silence(at: number): void {
+    for (let i = 0; i < this.live.length; i++) {
+      const src = this.live[i].sources;
+      for (let k = 0; k < src.length; k++) {
+        try {
+          src[k].stop(at);
+        } catch {
+          /* already stopped */
+        }
+      }
+    }
+  }
+
+  /** Stop scheduling: give back the track's hold on the voice and the music duck (which lasts until `duckAt`). */
+  private end(duckAt: number): void {
+    if (!this.released) {
+      this.released = true;
+      const voice = this.ev.bag;
+      if (voice.serial === this.serial) voice.unhold();
+    }
+    if (this.ducked) {
+      this.ducked = false;
+      this.ev.core.releaseDuck(duckAt);
+    }
+    if (!this.ended) {
+      this.ended = true;
+      const f = this.onEnd;
+      this.onEnd = null;
+      if (f) f();
     }
   }
 }

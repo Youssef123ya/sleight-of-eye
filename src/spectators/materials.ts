@@ -214,16 +214,26 @@ function makeConeGeometry(maxHalf: number, segs: number): BufferGeometry {
   return g;
 }
 
-/** Soft wedge with a brighter rim, slow outward ripples and a red alarm pulse. One per spectator (uniforms). */
+/** Per-frame cone uniforms packed in one vec4 (see `coneState`). */
+export const CONE_OPACITY = 0;
+export const CONE_ALARM = 1;
+export const CONE_TIME = 2;
+export const CONE_HALF = 3;
+
+/**
+ * Soft wedge with a brighter rim, slow outward ripples and a red alarm pulse. One per spectator (uniforms).
+ * The animated values live in ONE vec4 uniform whose value is a Float32Array: writing its elements allocates
+ * nothing, whereas assigning a fresh double to a `{ value }` uniform boxes a heap number on every write, and three
+ * uploads a typed-array vec4 through its array path (no property reads either).
+ */
 export function coneMaterial(color: number): ShaderMaterial {
+  const state = new Float32Array(4);
+  state[CONE_HALF] = 22 * DEG;
   return new ShaderMaterial({
     uniforms: {
       uColor: { value: new Color(color) },
       uAlarmColor: { value: new Color(PAL.alarm) },
-      uOpacity: { value: 0 },
-      uAlarm: { value: 0 },
-      uTime: { value: 0 },
-      uHalf: { value: 22 * DEG },
+      uState: { value: state }, // x opacity, y alarm 0..1, z time (s), w half angle (rad)
     },
     vertexShader: /* glsl */ `
       varying vec2 vP;
@@ -234,12 +244,13 @@ export function coneMaterial(color: number): ShaderMaterial {
     fragmentShader: /* glsl */ `
       uniform vec3 uColor;
       uniform vec3 uAlarmColor;
-      uniform float uOpacity;
-      uniform float uAlarm;
-      uniform float uTime;
-      uniform float uHalf;
+      uniform vec4 uState;
       varying vec2 vP;
       void main() {
+        float uOpacity = uState.x;
+        float uAlarm = uState.y;
+        float uTime = uState.z;
+        float uHalf = uState.w;
         float r = length( vP );
         float a = abs( atan( vP.x, vP.y ) ) / uHalf;
         float inside = 1.0 - smoothstep( 0.86, 1.04, a );
@@ -258,4 +269,9 @@ export function coneMaterial(color: number): ShaderMaterial {
     side: FrontSide,
     toneMapped: false,
   });
+}
+
+/** The cone material's animated uniform values (index with CONE_OPACITY / CONE_ALARM / CONE_TIME / CONE_HALF). */
+export function coneState(mat: ShaderMaterial): Float32Array {
+  return mat.uniforms.uState.value as Float32Array;
 }

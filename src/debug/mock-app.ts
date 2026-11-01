@@ -2,6 +2,8 @@
 // the spec's verbs (head gaze + dwell, pinch-lift, pinch-palm with a sight-cone catch, look back, poke-reveal).
 // It exists so tests/lib/iwer.mjs (lookAt, pinchAt, pokeAt, waitForState) and the act scenarios can be proven
 // end-to-end before the real game is integrated. It never installs over a real `window.__app`.
+// A catch behaves like the game's (src/game/tricks.ts caught()): phase 'caught' + the catcher's `alarm` for
+// CFG.catchCaptionTime + half the rewind smear (pinches ignored), then the beat rewinds (phase 'active', alarm null).
 //
 // Hands are read straight from WebXR (fillPoses on thumb/index tips + select events), gaze is the head ray.
 // Per-frame code allocates nothing: class fields (V8 keeps doubles in place), indexed loops, scratch vectors, and
@@ -66,6 +68,10 @@ class MockAct1 {
   readonly stars = [0, 0, 0];
   settings: Settings = { ...DEFAULT_SETTINGS };
   lastCatchBy: string | null = null;
+  phase: 'active' | 'caught' = 'active';
+  alarm: string | null = null; // the catcher while its cone flashes
+  caughtLeft = 0; // seconds of the 'caught' hold left before the rewind
+  firstWatcher: string | null = null; // a kit whose sight cone holds the mat this frame (the would-be catcher)
   boundSession: XRSession | null = null;
 
   // scene
@@ -257,6 +263,7 @@ class MockAct1 {
     this.rigInv.copy(this.rig.root.matrixWorld).invert();
     const half = (this.settings.easyAudience ? CFG.sightHalfAngleEasy : CFG.sightHalfAngle) * DEG;
     let w = 0;
+    let first: string | null = null;
     for (let i = 0; i < this.kits.length; i++) {
       const k = this.kits[i];
       this.turnToward(k, this.kitLook, dt);
@@ -265,9 +272,13 @@ class MockAct1 {
       worldPos(eyes, this.tmp);
       this.tmp2.copy(this.kitLook).sub(this.tmp).normalize();
       this.tmp.subVectors(this.matWorld, this.tmp).normalize();
-      if (Math.acos(Math.max(-1, Math.min(1, this.tmp.dot(this.tmp2)))) < half) w++;
+      if (Math.acos(Math.max(-1, Math.min(1, this.tmp.dot(this.tmp2)))) < half) {
+        w++;
+        if (first === null) first = k.id;
+      }
     }
     this.watchers = w;
+    this.firstWatcher = first;
     // music box dancer sways while it plays
     this.fx.gadgets.musicBox.root.rotation.y = this.musicBoxLeft > 0 ? Math.sin(time * 6) * 0.25 : 0;
   }
@@ -294,6 +305,19 @@ class MockAct1 {
 
   updateBeat(dt: number): void {
     const coin = this.fx.props.coin;
+    if (this.phase === 'caught') {
+      // "I SAW THAT!" holds the beat (pinches ignored), then the rewind restores the checkpoint
+      this.caughtLeft -= dt;
+      if (this.caughtLeft <= 0) {
+        this.caughtLeft = 0;
+        this.phase = 'active';
+        this.alarm = null;
+        this.resetBeatProps();
+      }
+      this.hands.left.pinchEdge = false;
+      this.hands.right.pinchEdge = false;
+      return;
+    }
     this.beatTime += dt;
     worldPos(coin, this.coinWorld);
     switch (this.kind()) {
@@ -325,9 +349,11 @@ class MockAct1 {
           if (side) {
             if (this.watchers > 0) {
               this.caught++;
-              this.lastCatchBy = this.kits[0]?.id ?? 'kit';
+              this.lastCatchBy = this.firstWatcher ?? this.kits[0]?.id ?? 'kit';
+              this.alarm = this.lastCatchBy;
+              this.phase = 'caught';
+              this.caughtLeft = CFG.catchCaptionTime + CFG.rewindTime * 0.5;
               console.info(`[mock] ${this.lastCatchBy}: "I SAW THAT!" (watchers ${this.watchers}) — rewinding the beat`);
-              this.resetBeatProps();
             } else {
               this.coinState = 'palmed';
               this.coinSide = side;
@@ -425,7 +451,9 @@ class MockAct1 {
       act: this.act,
       beat: this.beat,
       beatKind: this.kind(),
+      phase: this.phase,
       caught: this.caught,
+      alarm: this.alarm,
       palmed: this.palmed,
       loaded: this.loaded,
       gazeTarget: this.gazeTarget,
@@ -444,6 +472,9 @@ class MockAct1 {
     this.act = Math.max(1, Math.min(3, Math.round(a)));
     this.beat = Math.max(0, Math.min(BEATS.length - 1, Math.round(b)));
     this.loaded = null;
+    this.phase = 'active';
+    this.alarm = null;
+    this.caughtLeft = 0;
     this.resetBeatProps();
   }
 }

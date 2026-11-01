@@ -1,11 +1,13 @@
 // Speech-bubble captions: canvas text (≈4200 px/m, ≥2× display density at 0.7 m), yaw-billboarded toward the
 // player, anchored above an Object3D. Styles: speech (cream bubble), shout (red jagged burst + jolt),
 // whisper (dashed, italic, drifting). A pool of 4 bubbles; one draw call per visible bubble.
+// Bubbles move every frame, so their matrices are written directly (xform.ts): no quaternion/Euler re-syncs.
 import { Group, Mesh, MeshBasicMaterial, PlaneGeometry, Vector3, type Object3D } from '@iwsdk/core';
 import { clamp01, easeInCubic, easeOutBack } from './anim.js';
 import { createCanvasTexture, fitWrapped, font, roundRectPath, type CanvasTex } from './canvas.js';
 import type { UICtx } from './context.js';
 import { FONT_BODY } from './fonts.js';
+import { manualMatrix, planarPose, setPlanarPose, setYawPose } from './xform.js';
 
 export type CaptionStyle = 'speech' | 'shout' | 'whisper';
 
@@ -17,6 +19,7 @@ const LIFT = 0.045; // metres above the anchor
 const TOWARD_EYE = 0.018; // nudge toward the player so ears/hats never clip the bubble
 const IN_T = 0.28;
 const OUT_T = 0.2;
+const DEG = Math.PI / 180;
 
 interface Slot {
   ct: CanvasTex;
@@ -33,9 +36,13 @@ interface Slot {
   seed: number;
   active: boolean;
   born: number;
+  /** bubble base in rig space (above the anchor, nudged toward the eye): kept for blocks() */
+  readonly base: Vector3;
 }
 
 const tmp = new Vector3();
+const face = new Vector3(0, 0, 1); // unit horizontal direction a bubble faces (toward the eye)
+const pose = planarPose();
 
 export class Captions {
   private readonly slots: Slot[] = [];
@@ -58,13 +65,17 @@ export class Captions {
       const mesh = new Mesh(this.geo, mat);
       mesh.name = `ui-caption-${i}`;
       mesh.renderOrder = 30;
+      manualMatrix(mesh);
+      setPose(mesh, 0, 1e-4, 1e-4, 0, 0); // collapsed until a caption sizes it
       const group = new Group();
       group.name = `ui-caption-slot-${i}`;
       group.visible = false;
+      manualMatrix(group);
       group.add(mesh);
       ctx.root.add(group);
       this.slots.push({
         ct, mat, group, mesh, target: null, style: 'speech', age: 0, hold: 2, out: -1, w: 0.1, h: 0.05, seed: i, active: false, born: 0,
+        base: new Vector3(),
       });
     }
   }
@@ -90,7 +101,36 @@ export class Captions {
     slot.active = true;
     slot.born = ++this.serial;
     slot.group.visible = true;
+    setPose(slot.mesh, 0, slot.w * 0.2, slot.h * 0.2, 0, 0); // the pop-in starts at 20 %
     this.place(slot);
+  }
+
+  /**
+   * True while a bubble that is not on its way out sits within `marginDeg` of rig-local point `p` as seen from
+   * the eye (bubble angular radius included). Hints ask this to stay out of a caption's way. Allocation-free.
+   */
+  blocks(p: Vector3, marginDeg = 8): boolean {
+    const eye = this.ctx.eye;
+    const px = p.x - eye.x;
+    const py = p.y - eye.y;
+    const pz = p.z - eye.z;
+    const pl = Math.sqrt(px * px + py * py + pz * pz);
+    if (pl < 1e-4) return false;
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i];
+      if (!s.active || s.out >= 0) continue;
+      const g = s.base;
+      const cx = g.x - eye.x;
+      const cy = g.y + s.h * 0.5 - eye.y; // bubble centre: the pivot is the tail tip at the bottom
+      const cz = g.z - eye.z;
+      const cl = Math.sqrt(cx * cx + cy * cy + cz * cz);
+      if (cl < 1e-4) continue;
+      const cos = (px * cx + py * cy + pz * cz) / (pl * cl);
+      const sep = Math.acos(cos > 1 ? 1 : cos < -1 ? -1 : cos);
+      const radius = Math.atan((0.5 * (s.w > s.h ? s.w : s.h)) / cl);
+      if (sep < radius + marginDeg * DEG) return true;
+    }
+    return false;
   }
 
   clear(): void {
@@ -122,46 +162,54 @@ export class Captions {
         alpha = clamp01(s.age / 0.1);
       }
       this.place(s);
-      const m = s.mesh;
-      m.position.set(0, 0, 0);
-      m.rotation.set(0, 0, 0);
       let sx = scale;
       let sy = scale;
+      let ox = 0;
+      let oy = 0;
+      let rz = 0;
       if (s.style === 'shout') {
         // the jolt: a punchy scale kick and a fast decaying shake
         const k = Math.exp(-s.age * 7.5);
         const punch = 1 + 0.32 * Math.exp(-s.age * 9);
         sx *= punch;
         sy *= punch;
-        m.rotation.z = 0.16 * Math.sin(s.age * 58) * k + 0.012 * Math.sin(time * 31 + s.seed);
-        m.position.x = 0.005 * Math.sin(s.age * 71) * k;
+        rz = 0.16 * Math.sin(s.age * 58) * k + 0.012 * Math.sin(time * 31 + s.seed);
+        ox = 0.005 * Math.sin(s.age * 71) * k;
       } else if (s.style === 'whisper') {
-        m.position.y = 0.003 * Math.sin(time * 2.2 + s.seed);
-        m.rotation.z = 0.025 * Math.sin(time * 1.3 + s.seed);
+        oy = 0.003 * Math.sin(time * 2.2 + s.seed);
+        rz = 0.025 * Math.sin(time * 1.3 + s.seed);
       } else {
-        m.position.y = 0.0015 * Math.sin(time * 3.1 + s.seed);
+        oy = 0.0015 * Math.sin(time * 3.1 + s.seed);
       }
-      m.scale.set(s.w * sx, s.h * sy, 1);
+      pose.angle = rz;
+      pose.sx = s.w * sx;
+      pose.sy = s.h * sy;
+      pose.x = ox;
+      pose.y = oy;
+      pose.z = 0;
+      setPlanarPose(s.mesh, pose);
       s.mat.opacity = alpha;
     }
   }
 
-  /** Position above the anchor and turn (yaw only) to face the player. */
+  /** Position above the anchor and turn (yaw only) to face the player. Allocation-free (per frame). */
   private place(s: Slot): void {
-    const g = s.group;
-    if (s.target) {
-      s.target.getWorldPosition(tmp);
-      this.ctx.rig.toLocal(tmp, tmp);
-      if (Number.isFinite(tmp.x + tmp.y + tmp.z)) g.position.copy(tmp);
-    }
+    if (!s.target) return;
+    // the anchor's world matrix as the renderer left it (≤ 1 frame stale): no recomposition of the entity chain
+    this.ctx.frame.objectLocal(s.target, tmp);
+    if (!Number.isFinite(tmp.x + tmp.y + tmp.z)) return; // keep the last pose
     const eye = this.ctx.eye;
-    const dx = eye.x - g.position.x;
-    const dz = eye.z - g.position.z;
-    const d = Math.hypot(dx, dz) || 1;
-    g.position.x += (dx / d) * TOWARD_EYE;
-    g.position.z += (dz / d) * TOWARD_EYE;
-    g.position.y += LIFT;
-    g.rotation.set(0, Math.atan2(dx, dz), 0);
+    const dx = eye.x - tmp.x;
+    const dz = eye.z - tmp.z;
+    const d = Math.sqrt(dx * dx + dz * dz);
+    // face the eye (yaw only): local +Z → (dx, 0, dz) / d
+    face.x = d > 1e-6 ? dx / d : 0;
+    face.z = d > 1e-6 ? dz / d : 1;
+    const b = s.base;
+    b.x = tmp.x + face.x * TOWARD_EYE;
+    b.y = tmp.y + LIFT;
+    b.z = tmp.z + face.z * TOWARD_EYE;
+    setYawPose(s.group, face, b);
   }
 
   dispose(): void {
@@ -172,6 +220,17 @@ export class Captions {
     }
     this.geo.dispose();
   }
+}
+
+/** Event-time convenience (show / construction): the per-frame path fills the shared pose itself. */
+function setPose(mesh: Mesh, angle: number, sx: number, sy: number, x: number, y: number): void {
+  pose.angle = angle;
+  pose.sx = sx;
+  pose.sy = sy;
+  pose.x = x;
+  pose.y = y;
+  pose.z = 0;
+  setPlanarPose(mesh, pose);
 }
 
 // ------------------------------------------------------------------------------------------ bubble art

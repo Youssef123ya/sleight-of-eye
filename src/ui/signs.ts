@@ -1,5 +1,6 @@
 // Hanging signs on gold ropes: the act title card (drops in, holds ~2 s, lifts) and the "Hold it!" banner.
 // Sign + ropes are one mesh with one canvas texture (the ropes sample a rope strip drawn below the art).
+// While a sign hangs, its pose is written straight into its matrices (xform.ts): no Euler/quaternion re-syncs.
 import { BufferGeometry, Group, Mesh, MeshBasicMaterial, PlaneGeometry } from '@iwsdk/core';
 import { mergeParts } from '../art/geometry.js';
 import { clamp01, deferred, easeInBack, Spring, type Deferred } from './anim.js';
@@ -17,9 +18,11 @@ import {
 } from './canvas.js';
 import type { UICtx } from './context.js';
 import { FONT_BODY, FONT_DISPLAY } from './fonts.js';
+import { manualMatrix, planarPose, setPlanarPose } from './xform.js';
 
 const STRIP = 28; // rope strip rows at the bottom of the canvas
 const GAP = 8;
+const pose = planarPose();
 
 interface SignSpec {
   name: string;
@@ -90,6 +93,9 @@ class HangingSign {
     this.group.visible = false;
     this.group.add(this.mesh);
     this.group.position.set(...spec.rest);
+    manualMatrix(this.group);
+    this.pose(0, spec.rest[0], spec.rest[1], spec.rest[2], 1);
+    manualMatrix(this.mesh);
     ctx.root.add(this.group);
     ropeStrip(this.ct.ctx, 0, spec.artH + GAP, spec.artW, STRIP, (spec.ropeW / spec.ropeLen) * (spec.artW / STRIP));
   }
@@ -167,9 +173,37 @@ class HangingSign {
         this.flip = 1;
       }
     }
-    this.group.position.set(x, y + off * 0.75, z);
-    this.group.rotation.set(0, 0, this.swing * 0.35 + idle * 0.5);
-    this.mesh.scale.set(1, Math.max(0.02, this.flip), 1);
+    // group: T · Rz(swing); sign mesh: the flip squashes it vertically (fields, not arguments: no boxing)
+    pose.angle = this.swing * 0.35 + idle * 0.5;
+    pose.sx = 1;
+    pose.sy = 1;
+    pose.x = x;
+    pose.y = y + off * 0.75;
+    pose.z = z;
+    setPlanarPose(this.group, pose);
+    pose.angle = 0;
+    pose.sy = Math.max(0.02, this.flip);
+    pose.x = 0;
+    pose.y = 0;
+    pose.z = 0;
+    setPlanarPose(this.mesh, pose);
+  }
+
+  /** Event time: group at rest, sign unflipped. */
+  private pose(swing: number, x: number, y: number, z: number, flip: number): void {
+    pose.angle = swing;
+    pose.sx = 1;
+    pose.sy = 1;
+    pose.x = x;
+    pose.y = y;
+    pose.z = z;
+    setPlanarPose(this.group, pose);
+    pose.angle = 0;
+    pose.sy = flip;
+    pose.x = 0;
+    pose.y = 0;
+    pose.z = 0;
+    setPlanarPose(this.mesh, pose);
   }
 
   dispose(): void {

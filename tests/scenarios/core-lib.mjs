@@ -100,5 +100,75 @@ export function makeHelpers(page, api) {
 
   const add = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 
-  return { page, api, t0, timeline, failures, note, state, events, where, waitFor, check, look, turnTo, reach, pinch, poke, rest, add };
+  /** window.__app.stage(): UI overlays on screen, curtain, visible cast (seated? rule target?), props, plaques. */
+  const stage = () => page.evaluate(() => window.__app?.stage?.() ?? null);
+
+  /** The game's tunables (src/config.ts, served by Vite), so waits follow CFG instead of hard-coded seconds. */
+  const cfg = () => page.evaluate(async () => (await import('/src/config.ts')).CFG);
+
+  /** Poke the Exit plaque. The session ends mid-poke, so the director's frame loop may never finish: not awaited. */
+  const pokeExit = async () => {
+    const p = await where('plaque-exit');
+    if (!p) throw new Error('plaque-exit missing');
+    poke(add(p, [0, 0.07, 0.07]), p, 0.9).catch(() => {});
+  };
+
+  /** Back into XR after an Exit: accept the re-offered session, seated eye looking at the mat. */
+  const reenter = () =>
+    page.evaluate(async (head) => {
+      const { DemoDirector } = await import('/capture/director.js');
+      const d = await DemoDirector.attach({ fovyDeg: 60 });
+      window.__director = d;
+      d.place({ head, look: [0, 0.9, -0.45] });
+    }, HEAD);
+
+  /**
+   * The calm 2D attract view (before the first Enter, after every Exit): no show running, Act I's kits idling on
+   * their seats, the coin alone on its mark, curtain open, every plaque back, and nothing left over from a beat.
+   */
+  async function checkAttract(label) {
+    const s = await state();
+    const st = await stage();
+    check(!!s && s.attract && !s.started && !s.running && s.act === 0 && s.phase === 'idle', `${label}: attract view, no show running`, {
+      attract: s?.attract,
+      started: s?.started,
+      act: s?.act,
+      phase: s?.phase,
+    });
+    if (!st) {
+      check(false, `${label}: window.__app.stage() available`);
+      return { s, st };
+    }
+    const cast = st.spectators.filter((x) => x.id !== 'rabbit');
+    check(JSON.stringify(cast.map((x) => x.id).sort()) === '["kit1","kit2","kit3"]', `${label}: Act I's three kits on stage`, {
+      cast: cast.map((x) => x.id),
+    });
+    check(cast.every((x) => x.seated), `${label}: every kit is on its seat`, { cast });
+    check(s.audienceIdle && cast.every((x) => x.target === null), `${label}: the audience idles and glances around (no rule drives them)`, {
+      idle: s.audienceIdle,
+      targets: cast.map((x) => x.target),
+    });
+    check(JSON.stringify(st.props) === JSON.stringify({ coin: 'home' }), `${label}: the coin alone, on its mark`, { props: st.props });
+    check(st.curtainClosed !== true && !st.overlays.some((o) => /curtain/.test(o)), `${label}: curtain open`, {
+      closed: st.curtainClosed,
+      overlays: st.overlays,
+    });
+    const left = st.overlays.filter((o) => !/curtain/.test(o));
+    check(left.length === 0, `${label}: no newspaper, captions, hints, banner, smear or spotlight`, { overlays: left });
+    check(
+      !s.reviewShown && s.hint === null && !s.musicBoxPlaying && s.palmed === null && !s.conesVisible && s.watchers === 0,
+      `${label}: no review, hint, music box, palm, cones or watchers`,
+      { review: s.reviewShown, hint: s.hint, musicBox: s.musicBoxPlaying, palmed: s.palmed, cones: s.conesVisible, watchers: s.watchers },
+    );
+    // the full set, not the bow's Retry + Exit (the real UI keeps Exit for XR only)
+    check(['retry', 'easy', 'assist', 'recenter'].every((p) => st.plaques.includes(p)), `${label}: the full plaque set on the table edge`, {
+      plaques: st.plaques,
+    });
+    return { s, st };
+  }
+
+  return {
+    page, api, t0, timeline, failures, note, state, events, where, waitFor, check, look, turnTo, reach, pinch, poke, rest, add,
+    stage, cfg, pokeExit, reenter, checkAttract,
+  };
 }

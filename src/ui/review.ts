@@ -47,6 +47,7 @@ const CANVAS_H = ART_H + GAP + STRIP;
 const LEAN = 60 * (Math.PI / 180); // from vertical: the top edge stays below the audience's faces
 const BASE: [number, number, number] = [0, L.tableY + 0.004, -0.255];
 const ACT_NAMES = ['The Vanishing Coin', 'Cups & Ball', "The Critic's Watch"];
+const SETTLED = 3; // s: landed (0.85 s) and the glint has swept past the page
 const ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI'];
 
 function curlZ(y: number): number {
@@ -187,7 +188,8 @@ export class Review {
   }
 
   update(dt: number): void {
-    if (this.t < 0) return;
+    // after the toss and the glint sweep the page rests: no per-frame work while it stays on the stand
+    if (this.t < 0 || this.t > SETTLED) return;
     this.t += dt;
     // toss in from above the stage, flutter, settle onto the stand
     const u = clamp01(this.t / 0.85);

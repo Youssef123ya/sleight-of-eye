@@ -72,6 +72,8 @@ export interface Watcher {
   mood: string;
   /** Drawn sight-cone half angle last sent (deg). */
   half: number;
+  /** Idle glancing has been handed to the spectator (attract view). */
+  idled: boolean;
 }
 
 export class Attention {
@@ -96,6 +98,8 @@ export class Attention {
   onFluster: ((w: Watcher) => void) | null = null;
   /** Spectators whose look is pinned (e.g. the volunteer faces the magician during the reveal). */
   private readonly pins = new Map<string, { target: Vector3 | 'player'; until: number }>();
+  /** Attract view: no rule drives anyone; every spectator idles and glances around (no glyphs, cones, tension). */
+  private idle = false;
 
   private readonly history = new PointHistory(160);
   private clock = 0;
@@ -116,11 +120,21 @@ export class Attention {
     private readonly settings: Signal<Settings>,
     private readonly ui: UI,
   ) {
-    rigFrame(rig).toWorld(L.mat.center, this.matFocus);
+    rigFrame(rig).toWorld([L.mat.center[0], L.mat.top, L.mat.center[2]], this.matFocus);
   }
 
   get time(): number {
     return this.clock;
+  }
+
+  get isIdle(): boolean {
+    return this.idle;
+  }
+
+  /** The attract view (true) or the show (false). Idle spectators are handed back to their own idle glances. */
+  setIdle(idle: boolean): void {
+    this.idle = idle;
+    for (const w of this.watchers) w.idled = false;
   }
 
   setLineup(specs: readonly Spectator[]): void {
@@ -153,6 +167,7 @@ export class Attention {
         cone: -1,
         mood: '',
         half: -1,
+        idled: false,
       };
       this.watchers.push(w);
     }
@@ -241,6 +256,10 @@ export class Attention {
     this.clock += dt;
     this.history.push(this.clock, this.gaze.point);
     if (this.frozen) return;
+    if (this.idle) {
+      this.updateIdle();
+      return;
+    }
     const t = this.clock;
     const half = this.seen.halfAngleDeg();
     let count = 0;
@@ -284,6 +303,34 @@ export class Attention {
       this.lastTension = count;
       this.lastTensionMax = max;
       this.safe(() => this.audio.setTension(count, max));
+    }
+  }
+
+  /** Attract view: each spectator glances around on its own (lookAt(null), once); nothing watches the mat. */
+  private updateIdle(): void {
+    for (let i = 0; i < this.watchers.length; i++) {
+      const w = this.watchers[i];
+      w.watchingMat = false;
+      if (!w.idled) {
+        w.idled = true;
+        w.hasTarget = false;
+        this.safe(() => w.spec.lookAt(null));
+      }
+      if (w.glyph !== 'hidden') {
+        w.glyph = 'hidden';
+        this.safe(() => w.spec.setEyeGlyph('hidden'));
+      }
+      if (w.cone !== 0) {
+        w.cone = 0;
+        this.safe(() => w.spec.setSightCone(false));
+      }
+    }
+    this.watcherCount = 0;
+    const max = this.watchers.length;
+    if (this.lastTension !== 0 || this.lastTensionMax !== max) {
+      this.lastTension = 0;
+      this.lastTensionMax = max;
+      this.safe(() => this.audio.setTension(0, max));
     }
   }
 

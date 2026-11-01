@@ -1,5 +1,5 @@
 // Silent audio stub (G): implements AudioEngine with no-ops, keeping a short log of what would have played
-// (window.__app.sources tells which modules are stubs; `audioLog` is handy in tests).
+// (window.__app.sources tells which modules are stubs; `window.__audioStub.log` is handy in tests).
 import type { AudioEngine } from '../contracts.js';
 
 export interface StubAudio extends AudioEngine {
@@ -40,8 +40,17 @@ export function createStubAudio(): StubAudio {
       stop: () => push('music:stop'),
       setMood: (m) => push(`music:${m}`),
     },
-    musicBox() {
-      push('musicBox');
+    musicBox(_at, seconds) {
+      // Infinity (Easy Audience) plays until the game stops it; the log shows both ends of the melody
+      push(`musicBox:${seconds}`);
+      let stopped = false;
+      return {
+        stop: () => {
+          if (stopped) return;
+          stopped = true;
+          push('stop:musicBox');
+        },
+      };
     },
     setTension(w, max) {
       engine.tension[0] = w;

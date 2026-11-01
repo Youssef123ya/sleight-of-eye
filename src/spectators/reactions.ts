@@ -1,10 +1,9 @@
 // Procedural reaction library: each reaction writes additive channels into a Pose as a pure function of its
 // local time. Squash/stretch, anticipation and overshoot live here; positions of hops live in the spectator.
-import type { Vector3 } from '@iwsdk/core';
 import { CFG } from '../config.js';
 import type { ReactionName, SpectatorKind } from '../contracts.js';
 import type { Traits } from './designs/common.js';
-import { DEG, TAU, bump, easeInCubic, easeInOut, easeOutBack, env, lerp, seg } from './math.js';
+import { DEG, TAU, bump, copy3, easeInCubic, easeInOut, easeOutBack, env, lerp, seg, set3 } from './math.js';
 import { PK, type Pose } from './pose.js';
 
 /** Default durations (seconds); `opts.duration` overrides the looping ones. */
@@ -42,12 +41,12 @@ export interface ReactionCtx {
   drop: number;
   toeZ: number;
   inHat: boolean;
-  /** Unit direction (chest space) to the reaction target, and whether one was given. */
-  target: Vector3;
+  /** Unit direction (chest space, x y z) to the reaction target, and whether one was given. */
+  target: Float64Array;
   hasTarget: boolean;
-  /** Out: arm aim directions (chest space, need not be normalised). */
-  aimL: Vector3;
-  aimR: Vector3;
+  /** Out: arm aim directions (chest space, x y z, need not be normalised). */
+  aimL: Float64Array;
+  aimR: Float64Array;
 }
 
 export function poseReaction(name: ReactionName, c: ReactionCtx, o: Pose): void {
@@ -127,14 +126,14 @@ function gasp(c: ReactionCtx, o: Pose): void {
   } else if (c.kind === 'badger') {
     // pencil hand flies to his cheek, notebook clutched to the chest
     o[PK.aimR] += sh;
-    c.aimR.set(-0.55, 0.65, 0.55);
+    set3(c.aimR, -0.55, 0.65, 0.55);
     o[PK.armLSwing] -= 12 * DEG * sh;
   } else {
     // paws fly up to the cheeks
     o[PK.aimL] += sh;
     o[PK.aimR] += sh;
-    c.aimL.set(0.55, 0.5, 0.68);
-    c.aimR.set(-0.55, 0.5, 0.68);
+    set3(c.aimL, 0.55, 0.5, 0.68);
+    set3(c.aimR, -0.55, 0.5, 0.68);
     o[PK.reach] += 0.5 * sh;
   }
 }
@@ -288,12 +287,12 @@ function pointSqueak(c: ReactionCtx, o: Pose): void {
   o[PK.wide] += 0.3 * j;
   o[PK.earPerk] += 0.6 * e;
   o[PK.tailLift] += 0.9 * e;
-  const useLeft = c.kind === 'badger' ? false : c.hasTarget ? c.target.x >= 0 : true;
+  const useLeft = c.kind === 'badger' ? false : c.hasTarget ? c.target[0] >= 0 : true;
   const dir = useLeft ? c.aimL : c.aimR;
-  if (c.hasTarget) dir.copy(c.target);
-  else dir.set(useLeft ? 0.2 : -0.2, -0.25, 1);
+  if (c.hasTarget) copy3(dir, c.target);
+  else set3(dir, useLeft ? 0.2 : -0.2, -0.25, 1);
   // jab: the arm thrusts a little further along the line each time
-  dir.y += 0.25 * j;
+  dir[1] += 0.25 * j;
   o[useLeft ? PK.aimL : PK.aimR] += e;
   o[PK.reach] += (0.6 + 0.4 * j) * e;
   // the other paw goes to the hip
@@ -364,8 +363,8 @@ function cheer(c: ReactionCtx, o: Pose): void {
   } else {
     o[PK.aimL] += e;
     o[PK.aimR] += e;
-    c.aimL.set(1, 0.62 + wave, 0.22);
-    c.aimR.set(-1, 0.62 - wave, 0.22);
+    set3(c.aimL, 1, 0.62 + wave, 0.22);
+    set3(c.aimR, -1, 0.62 - wave, 0.22);
     o[PK.reach] += e;
     if (c.kind === 'badger') o[PK.notebook] += 0.3 * e;
   }
@@ -397,12 +396,12 @@ function giggle(c: ReactionCtx, o: Pose): void {
   } else if (c.kind === 'badger') {
     o[PK.notebook] += 0.55 * e;
     o[PK.aimR] += 0.8 * e;
-    c.aimR.set(-0.45, 0.55, 0.7);
+    set3(c.aimR, -0.45, 0.55, 0.7);
   } else {
     o[PK.aimL] += 0.95 * e;
     o[PK.aimR] += 0.95 * e;
-    c.aimL.set(-0.35, 0.32, 0.88);
-    c.aimR.set(0.35, 0.32, 0.88);
+    set3(c.aimL, -0.35, 0.32, 0.88);
+    set3(c.aimR, 0.35, 0.32, 0.88);
     o[PK.reach] += 0.7 * e;
     o[PK.mouth] += 0.3 * e;
   }
@@ -419,8 +418,8 @@ function blushScribble(c: ReactionCtx, o: Pose): void {
     // notebook held up under his snout like a menu to hide behind; the pencil hand scribbles on it
     o[PK.aimL] += e;
     o[PK.aimR] += e;
-    c.aimL.set(-0.2, 0.21, 0.96);
-    c.aimR.set(0.25, 0.26, 0.93);
+    set3(c.aimL, -0.2, 0.21, 0.96);
+    set3(c.aimR, 0.25, 0.26, 0.93);
     o[PK.reach] += 0.85 * e;
     o[PK.handL] += 0.9 * e;
     o[PK.scribble] += e * (1 - 0.7 * peek);
@@ -443,8 +442,8 @@ function blushScribble(c: ReactionCtx, o: Pose): void {
     // shy: paws to the face, swaying
     o[PK.aimL] += e;
     o[PK.aimR] += e;
-    c.aimL.set(0.42, 0.52, 0.74);
-    c.aimR.set(-0.42, 0.52, 0.74);
+    set3(c.aimL, 0.42, 0.52, 0.74);
+    set3(c.aimR, -0.42, 0.52, 0.74);
     o[PK.reach] += 0.5 * e;
     o[PK.eyeAway] += 0.8 * e;
     o[PK.tilt] += 12 * DEG * Math.sin(c.t * 2.2) * e;
@@ -497,7 +496,7 @@ function bow(c: ReactionCtx, o: Pose): void {
     o[PK.armLSwing] -= 25 * DEG * e;
   } else {
     o[PK.aimR] += e;
-    c.aimR.set(0.62, -0.42, 0.66);
+    set3(c.aimR, 0.62, -0.42, 0.66);
     o[PK.armLRaise] += 58 * DEG * e;
     o[PK.armLSwing] -= 12 * DEG * e;
   }

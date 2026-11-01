@@ -1,6 +1,10 @@
 // UI factory: builds every in-XR UI element under rig.root and returns the UI contract implementation.
 // Each element lives in its own file; this one wires them together and drives them from ui.update().
-import { Group, Mesh, PlaneGeometry, Vector3, type Object3D, type World } from '@iwsdk/core';
+// XR-only elements (plaques, hints, the "Hold it!" banner, the gaze spotlight, plus the gameplay overlays: captions,
+// title cards, the rewind smear) live under their own root, hidden in the 2D view behind the landing page so it shows
+// a calm café; they pop back when the immersive session is visible. The diegetic set pieces (curtain, newspaper,
+// posters) stay in both views.
+import { Group, Mesh, PlaneGeometry, Vector3, VisibilityState, type Object3D, type World } from '@iwsdk/core';
 import type {
   Cafe,
   GameEvents,
@@ -19,9 +23,10 @@ import type { StageRig } from '../layout.js';
 import { Captions } from './captions.js';
 import type { UICtx } from './context.js';
 import { Curtain } from './curtain.js';
+import { UIFrame } from './frame.js';
 import { ensureFonts } from './fonts.js';
 import { disposeTrailGeometry, GazeTrailHint } from './gazeTrail.js';
-import { buildGloveShared, GloveHint, type GloveShared, type ManagedHint } from './glove.js';
+import { buildGloveShared, GloveHint, type GloveShared, type HintBusy, type ManagedHint } from './glove.js';
 import { Plaques } from './plaques.js';
 import { Posters } from './posters.js';
 import { Review } from './review.js';
@@ -31,12 +36,18 @@ import { Spotlight } from './spotlight.js';
 
 type Deps = { pokes: PokeRegistry; gazeTargets: GazeTargetRegistry; events: Emitter<GameEvents>; cafe: Cafe | null };
 
-const _cam = new Vector3();
-
 /** The UI implementation (contract `UI` plus a few extras the demo/debug tools use). */
 export class GameUI implements UI {
   readonly root = new Group();
+  /** Parent of the XR-only elements (plaques, hints, banner, spotlight, captions, title card, rewind): hidden in 2D. */
+  readonly xrRoot = new Group();
+  /**
+   * Hide the XR-only elements while the page is non-immersive (the landing page's café backdrop). The module demo
+   * turns this off so the elements can be inspected in a plain browser.
+   */
+  autoHide2D = true;
   private readonly ctx: UICtx;
+  private readonly xrCtx: UICtx;
   private readonly eye = new Vector3(0, 0, 0);
   private readonly spot: Spotlight;
   private readonly captions: Captions;
@@ -56,6 +67,16 @@ export class GameUI implements UI {
   private wasPresenting = false;
   private warmUndo: Array<() => void> | null = null;
   private warmHints: ManagedHint[] = [];
+  /** XR-only elements currently shown (null until the first update decides). */
+  private xrShown: boolean | null = null;
+  /**
+   * world.visibilityState, cached by a subscription: this preact build's `peek()` wraps the read in
+   * `untracked(() => …)`, which allocates a closure on every call.
+   */
+  private visState: VisibilityState = VisibilityState.NonImmersive;
+  private readonly offVisibility: () => void;
+  /** Bound once: ghost gloves bow out while a caption is up near their target. */
+  private readonly captionBusy: HintBusy;
 
   constructor(
     private readonly world: World,
@@ -64,27 +85,41 @@ export class GameUI implements UI {
   ) {
     this.root.name = 'ui-root';
     rig.root.add(this.root);
+    this.xrRoot.name = 'ui-xr-only';
+    this.root.add(this.xrRoot);
     let aniso = 4;
     try {
       aniso = Math.min(8, world.renderer.capabilities.getMaxAnisotropy() || 4);
     } catch {
       /* keep the default */
     }
-    this.ctx = { world, rig, root: this.root, eye: this.eye, anisotropy: aniso };
-    this.spot = new Spotlight(this.ctx);
-    this.captions = new Captions(this.ctx);
-    this.plaques = new Plaques(this.ctx, {
+    const frame = new UIFrame(rig);
+    let off: () => void = () => {};
+    try {
+      off = world.visibilityState.subscribe((v) => {
+        this.visState = v;
+      });
+    } catch {
+      /* no signal: stays non-immersive (2D) */
+    }
+    this.offVisibility = off;
+    this.ctx = { world, rig, frame, root: this.root, eye: this.eye, anisotropy: aniso };
+    this.xrCtx = { world, rig, frame, root: this.xrRoot, eye: this.eye, anisotropy: aniso };
+    this.spot = new Spotlight(this.xrCtx);
+    this.captions = new Captions(this.xrCtx);
+    this.captionBusy = (p) => this.captions.blocks(p);
+    this.plaques = new Plaques(this.xrCtx, {
       pokes: deps.pokes,
       gazeTargets: deps.gazeTargets,
       events: deps.events,
       anchors: deps.cafe?.plaqueAnchors ?? null,
     });
     this.curtainFx = new Curtain(this.ctx, deps.cafe);
-    this.title = new TitleCard(this.ctx);
-    this.rewind = new RewindSmear(this.ctx);
+    this.title = new TitleCard(this.xrCtx);
+    this.rewind = new RewindSmear(this.xrCtx);
     this.paper = new Review(this.ctx);
     this.posterWall = new Posters(this.ctx, deps.cafe?.posterWall ?? null);
-    this.bannerSign = new Banner(this.ctx);
+    this.bannerSign = new Banner(this.xrCtx);
     this.glove = buildGloveShared();
     // per-frame updaters, bound once (no closures allocated per frame)
     this.tickers = [
@@ -111,15 +146,15 @@ export class GameUI implements UI {
   }
 
   hintPinch(target: Object3D, side: Side = 'right'): Hint {
-    return this.addHint(new GloveHint(this.ctx, this.glove, 'pinch', target, side, this.rippleGeo));
+    return this.addHint(new GloveHint(this.xrCtx, this.glove, 'pinch', target, side, this.rippleGeo, this.captionBusy));
   }
 
   hintPoke(target: Object3D, side: Side = 'right'): Hint {
-    return this.addHint(new GloveHint(this.ctx, this.glove, 'poke', target, side, this.rippleGeo));
+    return this.addHint(new GloveHint(this.xrCtx, this.glove, 'poke', target, side, this.rippleGeo, this.captionBusy));
   }
 
   hintGaze(from: () => Vector3, to: Object3D): Hint {
-    return this.addHint(new GazeTrailHint(this.ctx, from, to));
+    return this.addHint(new GazeTrailHint(this.xrCtx, from, to));
   }
 
   clearHints(): void {
@@ -158,14 +193,21 @@ export class GameUI implements UI {
 
   update(dt: number, time: number): void {
     if (this.warmUndo) this.endWarmup();
-    // eye position in rig space (billboards, poke directions)
+    const frame = this.ctx.frame;
+    frame.sync(); // picks up a recalibration (a 16-number compare otherwise)
+    let immersive = false;
     try {
-      this.world.camera.getWorldPosition(_cam);
-      this.ctx.rig.toLocal(_cam, this.eye);
+      const world = this.world;
+      immersive = !!world.session && this.visState !== VisibilityState.NonImmersive;
+      // eye position in rig space (billboards, poke directions, the spotlight's line of sight). The head's world
+      // matrix is read as it is: getWorldPosition() would recompose the player/camera entities and allocate.
+      const head = immersive ? world.player.head : world.camera;
+      frame.objectLocal(head, this.eye);
       if (!Number.isFinite(this.eye.x + this.eye.y + this.eye.z)) this.eye.set(0, 0, 0);
     } catch {
       this.eye.set(0, 0, 0);
     }
+    this.applyXrVisibility(immersive || !this.autoHide2D);
     for (let i = 0; i < this.tickers.length; i++) {
       const tk = this.tickers[i];
       try {
@@ -209,10 +251,10 @@ export class GameUI implements UI {
       if (!this.warmHints.length) {
         const dummy = new Group();
         dummy.name = 'ui-warmup-anchor';
-        this.root.add(dummy);
+        this.xrRoot.add(dummy);
         this.warmHints = [
-          new GloveHint(this.ctx, this.glove, 'pinch', dummy, 'right', this.rippleGeo),
-          new GazeTrailHint(this.ctx, () => this.eye, dummy),
+          new GloveHint(this.xrCtx, this.glove, 'pinch', dummy, 'right', this.rippleGeo),
+          new GazeTrailHint(this.xrCtx, () => this.eye, dummy),
         ];
       }
       const undo: Array<() => void> = [];
@@ -230,11 +272,22 @@ export class GameUI implements UI {
         });
       }
       for (const m of hidden) {
-        const sx = m.scale.x;
-        const sy = m.scale.y;
-        const sz = m.scale.z;
-        m.scale.set(sx * 1e-5, sy * 1e-5, sz * 1e-5);
-        undo.push(() => m.scale.set(sx, sy, sz));
+        if (m.matrixAutoUpdate) {
+          const sx = m.scale.x;
+          const sy = m.scale.y;
+          const sz = m.scale.z;
+          m.scale.set(sx * 1e-5, sy * 1e-5, sz * 1e-5);
+          undo.push(() => m.scale.set(sx, sy, sz));
+        } else {
+          // directly-driven matrix (xform.ts): shrink the matrix itself, then restore it
+          const saved = m.matrix.clone();
+          m.matrix.scale(new Vector3(1e-5, 1e-5, 1e-5));
+          m.matrixWorldNeedsUpdate = true;
+          undo.push(() => {
+            m.matrix.copy(saved);
+            m.matrixWorldNeedsUpdate = true;
+          });
+        }
         for (let p: Object3D | null = m; p && p !== this.root.parent; p = p.parent) {
           if (!p.visible) {
             const o = p;
@@ -261,6 +314,25 @@ export class GameUI implements UI {
     }
   }
 
+  /**
+   * Show/hide the XR-only root. Coming back into view (the session became visible) the plaques re-read their
+   * anchors and pop in again, and the spotlight fades in at the new gaze point instead of sliding from the 2D one.
+   */
+  private applyXrVisibility(show: boolean): void {
+    if (show === this.xrShown) return;
+    const first = this.xrShown === null;
+    this.xrShown = show;
+    this.xrRoot.visible = show;
+    if (!show || first) return;
+    try {
+      this.plaques.refresh();
+      this.plaques.replayIntro();
+    } catch (e) {
+      this.fail('plaques-show', e);
+    }
+    this.spot.reset();
+  }
+
   // ------------------------------------------------------------------------------------------ extras
   /** Hide the review newspaper (e.g. when a new show starts). */
   hideReview(): void {
@@ -277,6 +349,7 @@ export class GameUI implements UI {
   }
 
   dispose(): void {
+    this.offVisibility();
     for (const h of this.hints) h.dispose();
     this.hints.length = 0;
     for (const h of this.warmHints) h.dispose();

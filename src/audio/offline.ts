@@ -12,7 +12,7 @@ import type { CrowdKind, Mood, SfxName, SpectatorKind } from '../contracts.js';
 import type { P3 } from './core.js';
 import { envAHD, hold, PopWriter, TargetChain } from './dsp.js';
 import { EngineImpl, LOOKAHEAD, type LoopHandle } from './engine.js';
-import type { MusicMood } from './music.js';
+import { MB_STOP_FADE, type MusicMood } from './music.js';
 import { SFX_NAMES } from './sfx.js';
 
 export interface AudioReportEntry {
@@ -279,6 +279,66 @@ function range(L: Float32Array, R: Float32Array, i0: number, i1: number): number
   let pk = 0;
   for (let i = Math.max(0, i0); i < Math.min(L.length, i1); i++) pk = Math.max(pk, Math.abs(L[i]), Math.abs(R[i]));
   return pk;
+}
+
+/** Butterworth section Qs for an 8th-order filter: 1 / (2 cos(π(2k−1)/16)), k = 1..4. */
+const BW8_Q = [0.5098, 0.6013, 0.9, 2.5629];
+
+/**
+ * Click detector, independent of the envelope audit: the dry channels (4/5) through an 8th-order Butterworth
+ * high-pass at 18 kHz, peak |y| inside [from, to). A step or a truncated waveform is broadband and shows up here;
+ * smooth envelopes on partials below ~11 kHz (the music box) stay >= 34 dB down. Filtered from t = 0 (no warm-up).
+ */
+function hfPeak(buf: AudioBuffer, from: number, to: number): number {
+  const w = (2 * Math.PI * 18000) / SR;
+  const c = Math.cos(w);
+  // RBJ high-pass biquads, normalised by a0: [b0, b1, b2, a1, a2] per section
+  const co = new Float64Array(BW8_Q.length * 5);
+  for (let k = 0; k < BW8_Q.length; k++) {
+    const al = Math.sin(w) / (2 * BW8_Q[k]);
+    const a0 = 1 + al;
+    co.set([(1 + c) / 2 / a0, -(1 + c) / a0, (1 + c) / 2 / a0, (-2 * c) / a0, (1 - al) / a0], k * 5);
+  }
+  const st = new Float64Array(BW8_Q.length * 4); // per section: x1, x2, y1, y2
+  const i0 = Math.max(0, Math.floor(from * SR));
+  const i1 = Math.min(buf.length, Math.floor(to * SR));
+  let pk = 0;
+  for (const ch of [4, 5]) {
+    const x = buf.getChannelData(ch);
+    st.fill(0);
+    for (let i = 0; i < i1; i++) {
+      let v = x[i];
+      for (let k = 0; k < BW8_Q.length; k++) {
+        const c5 = k * 5;
+        const s4 = k * 4;
+        const y = co[c5] * v + co[c5 + 1] * st[s4] + co[c5 + 2] * st[s4 + 1] - co[c5 + 3] * st[s4 + 2] - co[c5 + 4] * st[s4 + 3];
+        st[s4 + 1] = st[s4];
+        st[s4] = v;
+        st[s4 + 3] = st[s4 + 2];
+        st[s4 + 2] = y;
+        v = y;
+      }
+      if (i >= i0) pk = Math.max(pk, Math.abs(v));
+    }
+  }
+  return pk;
+}
+
+/** Dry (no reverb, no master) peak inside [from, to): what the voices themselves still play. */
+const dryPeak = (buf: AudioBuffer, from: number, to: number): number => peakIn(buf, from, to, 4);
+
+/**
+ * Chrome's HRTF panner delays its output by its FFT latency and rings for its impulse response: measured, a source's
+ * last sample leaves the panner ~10.7 ms after it went in (then the node's output is zeroed). "After the fade" checks
+ * start this much later.
+ */
+const PANNER_TAIL = 0.02;
+
+/** Quietest 100 ms window (dry peak) inside [from, to): a hole in a continuous part (a phrase seam) shows up here. */
+function dryFloor(buf: AudioBuffer, from: number, to: number): number {
+  let lo = Infinity;
+  for (let t = from; t + 0.1 <= to; t += 0.05) lo = Math.min(lo, dryPeak(buf, t, t + 0.1));
+  return lo;
 }
 
 // ------------------------------------------------------------------------------------ envelope audit
@@ -842,6 +902,54 @@ function note(r: AudioReportEntry, text: string, pass: boolean): void {
   if (!pass) r.ok = false;
 }
 
+/**
+ * A music box `seconds` long (Infinity = endless) closed with stop() at `stopT`, and stop() again mid-fade. Checks: no
+ * click (nothing above 18 kHz beyond what the tines' own attacks make: calibrated offline, a hard cut of the same box
+ * measures ~9e-3 there, stop() ~3e-7, the tines' attacks ~7e-6), the dry output silent after the fade + panner tail
+ * (nothing truncated, nothing scheduled in the lookahead window leaks out), voice + box released, the trio's duck
+ * engaged while it played and released after.
+ */
+function musicBoxStopJob(name: string, seconds: number, stopT: number, secs: number): Job {
+  const probe = { duckWhile: Number.NaN, boxesWhile: -1, voicesAfter: -1, boxesAfter: -1, duckAfter: Number.NaN };
+  return {
+    name,
+    secs,
+    pumps: true,
+    script: (e, at) => {
+      const h = e.musicBox(SOUND_POS.musicBox, seconds);
+      at(stopT - 0.5, () => {
+        probe.duckWhile = e.core.musicDuck.gain.value;
+        probe.boxesWhile = e.musicBoxes;
+      });
+      at(stopT, () => h.stop());
+      at(stopT + 0.05, () => h.stop()); // again, mid-fade: a no-op
+      at(stopT + 1.2, () => {
+        probe.voicesAfter = e.core.activeVoices();
+        probe.boxesAfter = e.musicBoxes;
+      });
+      at(Math.min(secs - 0.1, stopT + 2.6), () => (probe.duckAfter = e.core.musicDuck.gain.value));
+    },
+    check: (buf, r) => {
+      const playing = peakIn(buf, 0.3, stopT);
+      const hfPlay = hfPeak(buf, 0.3, stopT - 0.005);
+      const hfStop = hfPeak(buf, stopT - 0.005, stopT + MB_STOP_FADE + 0.05);
+      const after = dryPeak(buf, stopT + MB_STOP_FADE + PANNER_TAIL, secs);
+      note(
+        r,
+        `playing ${playing.toFixed(3)}; >18 kHz while playing ${hfPlay.toExponential(1)}, around stop() ${hfStop.toExponential(1)} ` +
+          `(a hard cut measures ~9e-3); dry after the ${Math.round(MB_STOP_FADE * 1000)} ms fade ${after === 0 ? 'exactly 0' : after.toExponential(1)}`,
+        playing > 0.01 && hfStop <= Math.max(2 * hfPlay, 1e-5) && after <= 1e-6,
+      );
+      note(
+        r,
+        `while playing: ${probe.boxesWhile} box, trio ducked to ${probe.duckWhile.toFixed(2)}; 1.2 s after stop(): ` +
+          `${probe.voicesAfter} voices, ${probe.boxesAfter} boxes; trio back to ${probe.duckAfter.toFixed(3)}`,
+        probe.boxesWhile === 1 && probe.duckWhile < 0.45 && probe.voicesAfter === 0 && probe.boxesAfter === 0 && probe.duckAfter > 0.99,
+      );
+    },
+  };
+}
+
 // --------------------------------------------------------------------------------------------- jobs
 
 const LINES: ReadonlyArray<readonly [SpectatorKind, Mood | undefined, string, P3]> = [
@@ -911,12 +1019,51 @@ function jobs(): Job[] {
     name: 'musicBox:2s (shortened show)',
     secs: 5,
     pumps: true,
-    script: (e) => e.musicBox(SOUND_POS.musicBox, 2),
+    script: (e, at) => {
+      const h = e.musicBox(SOUND_POS.musicBox, 2);
+      at(4.9, () => (h.stop(), h.stop())); // after the show has ended: a no-op
+    },
     check: (buf, r) => {
       const late = peakIn(buf, 3.6, 5); // the last tine (≤ 2.3 s) has rung out by ~3.5 s
       note(r, `active ${r.act.toFixed(2)}s; after 3.6 s ${late.toExponential(1)}`, late <= 0.01);
     },
   });
+  // stop(): an endless box and a finite one closed mid-note (a melody tine started 28 ms earlier: near its loudest)
+  list.push(musicBoxStopJob('musicBox:∞ → stop() mid-note (+ again)', Infinity, 3.24, 6.4));
+  list.push(musicBoxStopJob('musicBox:5s → stop() early, mid-note', 5, 2.04, 5.2));
+  {
+    const probe = { maxTines: 0, maxVoices: 0, boxes: -1, voicesAfter: -1 };
+    list.push({
+      // Easy Audience: plays until stopped, phrase after phrase; resources must stay flat and the seams seamless
+      name: 'musicBox:∞ for 18 s (A/B/A/B) → stop()',
+      secs: 20.4,
+      pumps: true,
+      script: (e, at) => {
+        const h = e.musicBox(SOUND_POS.musicBox, Infinity);
+        for (let t = 0.5; t < 18; t += 0.5) {
+          at(t, () => {
+            probe.maxTines = Math.max(probe.maxTines, e.musicBoxTines);
+            probe.maxVoices = Math.max(probe.maxVoices, e.core.activeVoices());
+          });
+        }
+        at(17.9, () => (probe.boxes = e.musicBoxes));
+        at(18.03, () => h.stop());
+        at(19.6, () => (probe.voicesAfter = e.core.activeVoices()));
+      },
+      check: (buf, r) => {
+        const floor = dryFloor(buf, 0.3, 18);
+        const last = dryPeak(buf, 16.5, 18);
+        const after = dryPeak(buf, 18.03 + MB_STOP_FADE + PANNER_TAIL, 20.4);
+        note(
+          r,
+          `quietest 100 ms before stop() ${floor.toFixed(4)} (no seams); at 16.5–18 s ${last.toFixed(3)}; dry after the fade ` +
+            `${after === 0 ? 'exactly 0' : after.toExponential(1)}; voices ≤ ${probe.maxVoices}, tines ringing ≤ ${probe.maxTines}; ` +
+            `boxes at 17.9 s ${probe.boxes}, voices after stop() ${probe.voicesAfter}`,
+          floor > 0.003 && last > 0.01 && after <= 1e-6 && probe.maxVoices === 1 && probe.maxTines <= 32 && probe.boxes === 1 && probe.voicesAfter === 0,
+        );
+      },
+    });
+  }
   list.push({
     name: 'musicBox:5s + 700 ms main-thread stall',
     secs: 9,
@@ -1097,6 +1244,18 @@ function jobs(): Job[] {
         e.crowd('nope' as CrowdKind, Number.NaN);
         e.crowd('applause', Infinity, { x: Infinity, y: 0, z: 0 });
         e.musicBox(SOUND_POS.musicBox, Number.NaN);
+        // handles from odd requests (endless, negative, zero, -Infinity, not a number, NaN position): stop() twice each
+        const boxes = [
+          e.musicBox(SOUND_POS.musicBox, Infinity),
+          e.musicBox(bad, -3),
+          e.musicBox(null, 0),
+          e.musicBox(SOUND_POS.musicBox, -Infinity),
+          e.musicBox(SOUND_POS.musicBox, 'soon' as unknown as number),
+        ];
+        for (const b of boxes) {
+          b.stop();
+          b.stop();
+        }
         e.setTension(Number.NaN, 0);
         e.setTension(3, Number.NaN);
         e.setTension(Infinity, 5);

@@ -2,10 +2,16 @@
 // every UI position is in RIG-LOCAL metres (layout.ts coordinates).
 import type { Group, Vector3, World } from '@iwsdk/core';
 import type { StageRig } from '../layout.js';
+import type { UIFrame } from './frame.js';
 
 export interface UICtx {
   world: World;
   rig: StageRig;
+  /**
+   * Allocation-free rig-local ↔ world conversions (inline arithmetic on the rig's matrices). Per-frame code uses
+   * this, never getWorldPosition()/localToWorld(), which recompose IWSDK entities and allocate on every call.
+   */
+  frame: UIFrame;
   root: Group;
   /** Eye (camera) position in rig-local space, refreshed at the start of every UI update. */
   readonly eye: Vector3;

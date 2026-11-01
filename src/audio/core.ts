@@ -9,7 +9,8 @@
 //
 // Every one-shot gets a pooled voice slot (cap 24; when full the oldest lower-priority voice is stolen with a
 // 15 ms fade) and, when it has a position, a pooled HRTF PannerNode. Its nodes are disconnected as soon as its
-// sources fire 'ended'. Nothing here runs per rendered frame except `setListenerPose` (allocation-free).
+// sources fire 'ended'. Nothing here runs per rendered frame except the listener (`followListener` while three's
+// AudioListener owns it: two field stores; else `setListenerMatrix`).
 import {
   cachedData,
   clamp,
@@ -219,6 +220,11 @@ export interface Track {
   abort?(): void;
 }
 
+/** Anything with a world matrix (an Object3D): three's column-major elements. */
+export interface ListenerHead {
+  readonly matrixWorld: { readonly elements: ArrayLike<number> };
+}
+
 export interface BeginOpts {
   bus: BusName;
   at?: P3 | null;
@@ -253,12 +259,26 @@ export class AudioCore {
   private readonly tracks: Track[] = [];
   private serial = 1;
   private duckLevel = 1;
-  private duckUntil = 0;
+  /** End of the timed ducks (-Infinity: none yet, so a duck at t = 0 is not mistaken for a running one). */
+  private duckUntil = Number.NEGATIVE_INFINITY;
+  /** Open-ended ducks (a music box playing until stopped) and the deepest level they ask for. */
+  private duckHolds = 0;
+  private duckHoldLevel = 1;
   private listenerSet = false;
   /** How many times the listener AudioParams were written (QA: proves still heads cost nothing). */
   listenerWrites = 0;
   /** Last listener pose (world): position, forward, up. Used for the stereo fallback when panners run out. */
   readonly listener = { x: 0, y: 1.2, z: 0, fx: 0, fy: 0, fz: -1, ux: 0, uy: 1, uz: 0 };
+  /**
+   * The pose being applied, staged in fields rather than passed along as arguments: V8 boxes the double arguments
+   * of every call it does not inline, which cost the per-frame listener path ~0.35 KB per frame (measured).
+   */
+  private readonly nextPose = { x: 0, y: 1.2, z: 0, fx: 0, fy: 0, fz: -1, ux: 0, uy: 1, uz: 0 };
+  /**
+   * While another owner (three's AudioListener on the XR head) writes the context's listener, the pose is only needed
+   * when a positional sound starts (panner reuse, stereo fallback pans): it is read from this head then, not per frame.
+   */
+  private listenerHead: ListenerHead | null = null;
   readonly stats = { stolen: 0, refused: 0, peakVoices: 0, fallbackPans: 0, pannersReused: 0, pannersFresh: 0 };
 
   constructor(ctx: BaseAudioContext, opts: { seed?: number; toDestination?: boolean } = {}) {
@@ -354,6 +374,7 @@ export class AudioCore {
     // Sanitise first: a NaN reaching an AudioParam throws, and a throw after the slot opened would leak it.
     const prio = fin(o.priority, 1);
     const at = o.at && Number.isFinite(o.at.x) && Number.isFinite(o.at.y) && Number.isFinite(o.at.z) ? o.at : null;
+    if (at) this.refreshListener();
     const slot = this.acquire(prio, !!o.loop);
     if (!slot) {
       this.stats.refused++;
@@ -538,6 +559,18 @@ export class AudioCore {
     this.tracks.push(t);
   }
 
+  /** Retire a track now (a stopped music box) instead of at its next pump. */
+  removeTrack(t: Track): void {
+    const i = this.tracks.indexOf(t);
+    if (i < 0) return;
+    this.tracks[i] = this.tracks[this.tracks.length - 1];
+    this.tracks.pop();
+  }
+
+  tracksInUse(): number {
+    return this.tracks.length;
+  }
+
   pumpTracks(until: number): void {
     for (let i = this.tracks.length - 1; i >= 0; i--) {
       let finished = true;
@@ -560,14 +593,52 @@ export class AudioCore {
 
   /** Duck the music bus to `level` from t0 until t1 (nested ducks keep the deepest level and the latest end). */
   duck(level: number, t0: number, t1: number): void {
-    const p = this.musicDuck.gain;
+    if (!Number.isFinite(level + t0 + t1)) return;
     const now = this.ctx.currentTime;
     if (now >= this.duckUntil) this.duckLevel = 1;
-    this.duckLevel = Math.min(this.duckLevel, level);
+    this.duckLevel = Math.min(this.duckLevel, clamp(level, 0, 1));
     this.duckUntil = Math.max(this.duckUntil, t1);
+    this.applyDuck(now, t0);
+  }
+
+  /**
+   * Open-ended duck (a music box that plays until stopped): from t0 the bus stays at or under `level` until the
+   * matching `releaseDuck`. Timed ducks (voices) nest inside it and return to the held level, not to 1.
+   */
+  holdDuck(level: number, t0: number): void {
+    const now = this.ctx.currentTime;
+    this.duckHolds++;
+    if (Number.isFinite(level)) this.duckHoldLevel = Math.min(this.duckHoldLevel, clamp(level, 0, 1));
+    this.applyDuck(now, Number.isFinite(t0) ? t0 : now);
+  }
+
+  /** End one open-ended duck: it becomes a timed duck lasting until `at`, then the bus glides back up. */
+  releaseDuck(at: number): void {
+    if (this.duckHolds <= 0) return;
+    const now = this.ctx.currentTime;
+    const level = this.duckHoldLevel;
+    if (--this.duckHolds === 0) this.duckHoldLevel = 1;
+    if (now >= this.duckUntil) this.duckLevel = 1;
+    this.duckLevel = Math.min(this.duckLevel, level);
+    this.duckUntil = Math.max(this.duckUntil, Number.isFinite(at) ? Math.max(now, at) : now);
+    this.applyDuck(now, now);
+  }
+
+  /** One smooth curve for every duck: down with tau 60 ms, back up (to the held level, else 1) with tau 350 ms. */
+  private applyDuck(now: number, t0: number): void {
+    const p = this.musicDuck.gain;
+    const held = this.duckHolds > 0 ? this.duckHoldLevel : 1;
+    const timed = this.duckUntil >= now ? this.duckLevel : 1;
     hold(p, now);
-    p.setTargetAtTime(this.duckLevel, Math.max(now, t0 - 0.04), 0.06);
-    p.setTargetAtTime(1, this.duckUntil + 0.08, 0.35);
+    if (timed < held) {
+      // a timed duck deeper than any hold: down now, back up to the held level (or 1) when it ends
+      p.setTargetAtTime(timed, Math.max(now, t0 - 0.04), 0.06);
+      p.setTargetAtTime(held, this.duckUntil + 0.08, 0.35);
+    } else if (held < 1) {
+      p.setTargetAtTime(held, Math.max(now, t0 - 0.04), 0.06); // the hold rules until it is released
+    } else {
+      p.setTargetAtTime(1, now, 0.35); // nothing ducks any more
+    }
   }
 
   /**
@@ -583,45 +654,91 @@ export class AudioCore {
     immediate = false,
     write = true,
   ): boolean {
-    if (!(Number.isFinite(px + py + pz + fx + fy + fz + ux + uy + uz))) return false;
+    const n = this.nextPose;
+    n.x = px; n.y = py; n.z = pz; n.fx = fx; n.fy = fy; n.fz = fz; n.ux = ux; n.uy = uy; n.uz = uz;
+    if (write) this.listenerHead = null;
+    return this.applyListener(immediate, write);
+  }
+
+  /**
+   * Another owner writes the context's listener: remember where the head is and read its pose lazily when a
+   * positional sound starts (nothing per frame; the renderer keeps the head's world matrix current).
+   */
+  followListener(head: ListenerHead): void {
+    this.listenerHead = head;
+    this.listenerSet = false; // write in full when ownership comes back
+  }
+
+  /** The followed head's pose as of now (routing only); a broken head is dropped, never thrown through begin(). */
+  private refreshListener(): void {
+    const head = this.listenerHead;
+    if (!head) return;
+    try {
+      this.setListenerMatrix(head.matrixWorld.elements, false);
+    } catch {
+      this.listenerHead = null;
+    }
+  }
+
+  /**
+   * The pose from a world matrix (three's column-major Matrix4.elements): position = column 3, forward = -column 2,
+   * up = column 1, normalised here. `write` = this engine owns the context's listener (else: cache only).
+   */
+  setListenerMatrix(m: ArrayLike<number>, write: boolean): boolean {
+    if (write) this.listenerHead = null;
+    const ux = m[4], uy = m[5], uz = m[6];
+    const bx = m[8], by = m[9], bz = m[10];
+    const ul = Math.sqrt(ux * ux + uy * uy + uz * uz) || 1;
+    const bl = Math.sqrt(bx * bx + by * by + bz * bz) || 1;
+    const n = this.nextPose;
+    n.x = m[12]; n.y = m[13]; n.z = m[14];
+    n.fx = -bx / bl; n.fy = -by / bl; n.fz = -bz / bl;
+    n.ux = ux / ul; n.uy = uy / ul; n.uz = uz / ul;
+    return this.applyListener(false, write);
+  }
+
+  private applyListener(immediate: boolean, write: boolean): boolean {
+    const n = this.nextPose;
+    if (!(Number.isFinite(n.x + n.y + n.z + n.fx + n.fy + n.fz + n.ux + n.uy + n.uz))) return false;
     const L = this.listener;
     if (!write) {
-      L.x = px; L.y = py; L.z = pz; L.fx = fx; L.fy = fy; L.fz = fz; L.ux = ux; L.uy = uy; L.uz = uz;
+      L.x = n.x; L.y = n.y; L.z = n.z; L.fx = n.fx; L.fy = n.fy; L.fz = n.fz; L.ux = n.ux; L.uy = n.uy; L.uz = n.uz;
       this.listenerSet = false; // write in full when ownership comes back
       return false;
     }
     if (
       this.listenerSet &&
-      Math.abs(px - L.x) + Math.abs(py - L.y) + Math.abs(pz - L.z) < 5e-4 &&
-      Math.abs(fx - L.fx) + Math.abs(fy - L.fy) + Math.abs(fz - L.fz) + Math.abs(ux - L.ux) + Math.abs(uy - L.uy) + Math.abs(uz - L.uz) < 2e-3
+      Math.abs(n.x - L.x) + Math.abs(n.y - L.y) + Math.abs(n.z - L.z) < 5e-4 &&
+      Math.abs(n.fx - L.fx) + Math.abs(n.fy - L.fy) + Math.abs(n.fz - L.fz) + Math.abs(n.ux - L.ux) + Math.abs(n.uy - L.uy) + Math.abs(n.uz - L.uz) < 2e-3
     ) {
       return false;
     }
     this.listenerSet = true;
     this.listenerWrites++;
-    L.x = px; L.y = py; L.z = pz; L.fx = fx; L.fy = fy; L.fz = fz; L.ux = ux; L.uy = uy; L.uz = uz;
+    L.x = n.x; L.y = n.y; L.z = n.z; L.fx = n.fx; L.fy = n.fy; L.fz = n.fz; L.ux = n.ux; L.uy = n.uy; L.uz = n.uz;
     const l = this.ctx.listener;
     if (l.positionX) {
       const t = this.ctx.currentTime;
       if (immediate) {
-        l.positionX.setValueAtTime(px, t); l.positionY.setValueAtTime(py, t); l.positionZ.setValueAtTime(pz, t);
-        l.forwardX.setValueAtTime(fx, t); l.forwardY.setValueAtTime(fy, t); l.forwardZ.setValueAtTime(fz, t);
-        l.upX.setValueAtTime(ux, t); l.upY.setValueAtTime(uy, t); l.upZ.setValueAtTime(uz, t);
+        l.positionX.setValueAtTime(L.x, t); l.positionY.setValueAtTime(L.y, t); l.positionZ.setValueAtTime(L.z, t);
+        l.forwardX.setValueAtTime(L.fx, t); l.forwardY.setValueAtTime(L.fy, t); l.forwardZ.setValueAtTime(L.fz, t);
+        l.upX.setValueAtTime(L.ux, t); l.upY.setValueAtTime(L.uy, t); l.upZ.setValueAtTime(L.uz, t);
       } else {
         // same smoothing scheme as three's AudioListener (which IWSDK also keeps on the head): no zipper noise
         const e = t + 0.02;
-        l.positionX.linearRampToValueAtTime(px, e); l.positionY.linearRampToValueAtTime(py, e); l.positionZ.linearRampToValueAtTime(pz, e);
-        l.forwardX.linearRampToValueAtTime(fx, e); l.forwardY.linearRampToValueAtTime(fy, e); l.forwardZ.linearRampToValueAtTime(fz, e);
-        l.upX.linearRampToValueAtTime(ux, e); l.upY.linearRampToValueAtTime(uy, e); l.upZ.linearRampToValueAtTime(uz, e);
+        l.positionX.linearRampToValueAtTime(L.x, e); l.positionY.linearRampToValueAtTime(L.y, e); l.positionZ.linearRampToValueAtTime(L.z, e);
+        l.forwardX.linearRampToValueAtTime(L.fx, e); l.forwardY.linearRampToValueAtTime(L.fy, e); l.forwardZ.linearRampToValueAtTime(L.fz, e);
+        l.upX.linearRampToValueAtTime(L.ux, e); l.upY.linearRampToValueAtTime(L.uy, e); l.upZ.linearRampToValueAtTime(L.uz, e);
       }
     } else {
-      l.setPosition(px, py, pz);
-      l.setOrientation(fx, fy, fz, ux, uy, uz);
+      l.setPosition(L.x, L.y, L.z);
+      l.setOrientation(L.fx, L.fy, L.fz, L.ux, L.uy, L.uz);
     }
     return true;
   }
 
   dispose(): void {
+    this.listenerHead = null;
     for (let i = 0; i < this.slots.length; i++) if (!this.slots[i].done) this.slots[i].finish();
     for (let i = 0; i < this.panners.length; i++) {
       try {

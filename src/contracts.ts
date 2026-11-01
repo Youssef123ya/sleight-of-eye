@@ -253,8 +253,8 @@ export interface AudioEngine {
     stop(fadeSeconds?: number): void;
     setMood(mood: 'calm' | 'tense' | 'triumph'): void;
   };
-  /** Music box melody from the gadget's position (plays for `seconds`). */
-  musicBox(at: Vector3, seconds: number): void;
+  /** Music box melody from the gadget's position (plays for `seconds`, Infinity = until stopped). */
+  musicBox(at: Vector3, seconds: number): { stop(): void };
   /** Tension pad level: number of spectators currently watching the mat. 0 → silent. */
   setTension(watchers: number, maxWatchers: number): void;
   /** Keep positional audio aligned with the head (call every frame with the camera). */

@@ -11,7 +11,9 @@
 // Robustness: the page going hidden suspends the context (and resuming it waits for visibility AND the game's
 // setPaused(false)); the scheduler slides its grid after main-thread stalls instead of scheduling into the past;
 // non-finite inputs never reach an AudioParam; every public method swallows (and logs once) its own errors.
-// QA: `window.__audio` is the debug view of the most recently created engine (state, voices, meter, …).
+// QA: `window.__audio` is READ-ONLY debug info about the most recently created engine (state, voices, music box
+// count, meter, …): a frozen object of getters with no controls. Code that needs the engine itself imports
+// `audioDebug(engine)` from this module.
 import { AudioContext as ThreeAudioContext, type Object3D } from '@iwsdk/core';
 import type { AudioEngine, CrowdKind, Mood, SfxName, SpectatorKind } from '../contracts.js';
 import { AudioCore, fin, MIX, warnOnce, type Ev, type P3 } from './core.js';
@@ -28,14 +30,17 @@ import { speak } from './voice.js';
  */
 export const TICK_MS = 25;
 export const LOOKAHEAD = 0.2;
-/** Music box length when the caller passes NaN; Infinity (Easy Audience) plays the longest show. */
+/** Music box length when the caller passes NaN / a non-number; Infinity plays until the handle's stop(). */
 const MUSIC_BOX_DEFAULT = 5;
-const MUSIC_BOX_MAX = 30;
+/** Longest finite show (seconds): a sanity bound, far beyond any beat. */
+const MUSIC_BOX_MAX = 600;
 
+/** Stop handle for loops and music boxes: stop() is idempotent and never throws. */
 export interface LoopHandle {
   stop(): void;
 }
-const NOOP_LOOP: LoopHandle = { stop() {} };
+/** Shared by every call that had nothing to start (locked, paused, pool full): frozen, so nobody can patch it. */
+const NOOP_LOOP: LoopHandle = Object.freeze({ stop() {} });
 
 /** Close an event that turned out to create no sources (keeps the voice pool clean). */
 function settle(ev: Ev, end: number): void {
@@ -51,6 +56,8 @@ export class EngineImpl {
   readonly pad: TensionPad;
   private lastHover = -1;
   private lastTink = -1;
+  /** Music boxes still scheduling notes (QA counts them; stop()/natural end/steal removes them). */
+  private readonly boxes: MusicBoxTrack[] = [];
 
   constructor(
     readonly ctx: BaseAudioContext,
@@ -150,12 +157,17 @@ export class EngineImpl {
     }
   }
 
-  musicBox(at: P3 | null | undefined, seconds: number): void {
-    // Easy Audience passes Infinity: the contract has no stop for it, so the box plays up to 30 s.
+  /**
+   * The music box from `at` for `seconds` (Infinity = until the handle's stop()). The trio ducks while it plays.
+   * stop() fades the box out over 120 ms (never under 30 ms), is idempotent, and is safe after the show ended.
+   */
+  musicBox(at: P3 | null | undefined, seconds: number): LoopHandle {
     const s = typeof seconds === 'number' && !Number.isNaN(seconds) ? seconds : MUSIC_BOX_DEFAULT;
-    const secs = clamp(s === Infinity ? MUSIC_BOX_MAX : s, 0.5, MUSIC_BOX_MAX);
-    const ev = this.core.begin({ bus: 'sfx', at, priority: 3, send: 0.3 });
-    if (!ev) return;
+    const endless = s === Infinity;
+    const secs = endless ? Infinity : clamp(s, 0.5, MUSIC_BOX_MAX);
+    // an endless box counts as a loop in the voice pool: one-shots never steal it, and leaked handles are capped
+    const ev = this.core.begin({ bus: 'sfx', at, priority: 3, send: 0.3, loop: endless });
+    if (!ev) return NOOP_LOOP;
     let track: MusicBoxTrack;
     try {
       track = new MusicBoxTrack(ev, secs);
@@ -163,9 +175,37 @@ export class EngineImpl {
       ev.bag.finish(); // never leak the voice slot
       throw e;
     }
+    const boxes = this.boxes;
+    boxes.push(track);
+    track.onEnd = () => {
+      const i = boxes.indexOf(track);
+      if (i < 0) return;
+      boxes[i] = boxes[boxes.length - 1];
+      boxes.pop();
+    };
     this.core.addTrack(track);
-    this.core.duck(0.4, ev.t, ev.t + track.duration - 1.6); // the trio listens to the music box
     this.core.pumpTracks(this.ctx.currentTime + LOOKAHEAD); // first notes now (guarded: a throwing track is retired)
+    return {
+      stop: () => {
+        try {
+          track.stop();
+        } catch (e) {
+          warnOnce('musicBox stop failed', e);
+        }
+      },
+    };
+  }
+
+  /** Music boxes still playing (scheduling notes). */
+  get musicBoxes(): number {
+    return this.boxes.length;
+  }
+
+  /** Tines ringing across the playing music boxes (QA: bounded for an endless box). */
+  get musicBoxTines(): number {
+    let n = 0;
+    for (let i = 0; i < this.boxes.length; i++) n += this.boxes[i].ringing;
+    return n;
   }
 
   setMood(m: MusicMood): void {
@@ -218,6 +258,9 @@ export class EngineImpl {
 
   dispose(): void {
     this.music.stop(0.05);
+    // the master is cut right below anyway: this stops the boxes' tine sources and gives back their duck
+    for (const b of this.boxes.slice()) b.stop(0.03);
+    this.boxes.length = 0;
     this.pad.dispose();
     this.core.dispose();
   }
@@ -230,13 +273,28 @@ export interface AudioMeter {
   rms: number;
 }
 
-/** Debug/QA view of a live engine (demo meters, tests, `window.__audio`). Not part of the game contract. */
-export interface AudioDebug {
+/** Voice-pool counters (a snapshot: reading it never hands out the engine's live object). */
+export interface AudioStats {
+  readonly stolen: number;
+  readonly refused: number;
+  readonly peakVoices: number;
+  readonly fallbackPans: number;
+  readonly pannersReused: number;
+  readonly pannersFresh: number;
+}
+
+/**
+ * Read-only debug info about a live engine: exactly what `globalThis.__audio` shows. A frozen object of getters — it
+ * has no controls (nothing to play, stop, pause or dispose) and writing to it changes nothing.
+ */
+export interface AudioDebugInfo {
   /** 'locked' before unlock, else the AudioContext state. */
   readonly state: string;
+  /** Pooled one-shot voices in use (an endless music box holds one). */
   readonly voices: number;
   readonly panners: number;
-  readonly stats: { stolen: number; refused: number; peakVoices: number; fallbackPans: number } | null;
+  /** Snapshot of the voice-pool counters (null before unlock). */
+  readonly stats: AudioStats | null;
   /** Who writes the context's listener: 'engine', 'three' (IWSDK's AudioListener on the XR head) or 'none' yet. */
   readonly listenerOwner: 'engine' | 'three' | 'none';
   /** Listener AudioParam writes by this engine so far (a still head adds none). */
@@ -245,10 +303,27 @@ export interface AudioDebug {
   readonly paused: boolean;
   /** The page is hidden (the engine suspends itself). */
   readonly hidden: boolean;
-  /** The engine itself (QA scripts call the contract through it). */
+  /** The café trio is sounding (a session is running, not just requested before unlock). */
+  readonly musicPlaying: boolean;
+  /** The trio's mood (as last set, also before unlock). */
+  readonly musicMood: MusicMood;
+  /** Music boxes still playing: an Easy Audience box stays at 1 until the game calls its handle's stop(). */
+  readonly musicBoxes: number;
+  /** Tension pad target, 0..1 (watchers / max). */
+  readonly tension: number;
+  /**
+   * Master output level over the last ~20 ms (into `out` when given, allocation-free; else a new object). The first
+   * call taps an analyser onto the output and reads 0; read again a frame later.
+   */
+  meter(out?: AudioMeter): AudioMeter;
+}
+
+/** Debug/QA access to a live engine for code that imports this module (the demo). Not part of the game contract. */
+export interface AudioDebug extends AudioDebugInfo {
+  /** The engine itself. */
   readonly engine: AudioEngine;
-  /** Master output level over the last ~20 ms (allocation-free; writes into `out`). */
-  meter(out: AudioMeter): AudioMeter;
+  /** The read-only view published as `globalThis.__audio`. */
+  readonly info: AudioDebugInfo;
   impl(): EngineImpl | null;
   context(): AudioContext | null;
   dispose(): void;
@@ -256,8 +331,8 @@ export interface AudioDebug {
 
 /** DOM events that count as user activation: a context the browser refused to start retries on the next one. */
 const GESTURES = ['pointerdown', 'pointerup', 'keydown', 'touchend', 'click'] as const;
-/** How often to look again for a three AudioListener driving the shared context (ms). */
-const LISTENER_SCAN_MS = 2000;
+/** How often to look again for a three AudioListener driving the shared context (setListener calls: ~2 s). */
+const LISTENER_SCAN_CALLS = 120;
 
 class LiveAudioEngine implements AudioEngine {
   private impl: EngineImpl | null = null;
@@ -277,9 +352,12 @@ class LiveAudioEngine implements AudioEngine {
   private gestureArmed = false;
   private threeListener: Object3D | null = null;
   private scanRoot: Object3D | null = null;
-  private listenerScanAt = -Infinity;
+  private scanCalls = 0;
   private owner: 'engine' | 'three' | 'none' = 'none';
   readonly music: AudioEngine['music'];
+  /** Read-only view (published as `globalThis.__audio`). */
+  readonly info: AudioDebugInfo;
+  /** The same view plus the controls the demo needs (module access only, never published). */
   readonly debug: AudioDebug;
 
   constructor() {
@@ -302,7 +380,8 @@ class LiveAudioEngine implements AudioEngine {
         }),
     };
     const self = this;
-    this.debug = {
+    // getters only (no setters) on a frozen object: assigning to a field changes nothing; nothing here is a control
+    const info: AudioDebugInfo = {
       get state() {
         return self.ctx && self.impl ? self.ctx.state : 'locked';
       },
@@ -313,7 +392,8 @@ class LiveAudioEngine implements AudioEngine {
         return self.impl ? self.impl.core.pannersInUse() : 0;
       },
       get stats() {
-        return self.impl ? self.impl.core.stats : null;
+        const s = self.impl?.core.stats;
+        return s ? Object.freeze({ ...s }) : null;
       },
       get listenerOwner() {
         return self.owner;
@@ -327,12 +407,27 @@ class LiveAudioEngine implements AudioEngine {
       get hidden() {
         return self.hidden;
       },
-      engine: this,
-      meter: (out) => this.readMeter(out),
-      impl: () => this.impl,
-      context: () => this.ctx,
-      dispose: () => this.dispose(),
+      get musicPlaying() {
+        return !!self.impl?.music.playing;
+      },
+      get musicMood() {
+        return self.mood;
+      },
+      get musicBoxes() {
+        return self.impl ? self.impl.musicBoxes : 0;
+      },
+      get tension() {
+        return self.impl ? self.impl.pad.value : 0;
+      },
+      meter: (out?: AudioMeter) => self.readMeter(out ?? { peak: 0, rms: 0 }),
     };
+    this.info = Object.freeze(info);
+    this.debug = Object.freeze(
+      Object.defineProperties(
+        { engine: this as AudioEngine, info: this.info, impl: () => this.impl, context: () => this.ctx, dispose: () => this.dispose() },
+        Object.getOwnPropertyDescriptors(this.info),
+      ) as AudioDebug,
+    );
   }
 
   private guard(what: string, fn: () => void): void {
@@ -461,9 +556,21 @@ class LiveAudioEngine implements AudioEngine {
     if (impl) this.guard(`crowd ${kind}`, () => impl.crowd(kind, intensity, at));
   }
 
-  musicBox(at: Vector3Like, seconds: number): void {
-    const impl = this.live();
-    if (impl) this.guard('musicBox', () => impl.musicBox(at, seconds));
+  /**
+   * Before unlock: nothing plays and the handle is a no-op. Once unlocked the box is scheduled even while the context
+   * is suspended (paused, hidden, or still resuming): the game restarts its box right after setPaused(false), while
+   * resume() is still pending, and it must not be dropped. A suspended clock stands still, so the box starts when
+   * audio runs again (behind the pause fade); stop() works either way.
+   */
+  musicBox(at: Vector3Like, seconds: number): { stop(): void } {
+    const impl = this.impl;
+    if (!impl || !this.ctx || this.ctx.state === 'closed') return NOOP_LOOP;
+    try {
+      return impl.musicBox(at, seconds);
+    } catch (e) {
+      warnOnce('musicBox failed', e);
+      return NOOP_LOOP;
+    }
   }
 
   /** Safe to call every frame: no allocation, and the pad ignores unchanged levels. */
@@ -480,37 +587,37 @@ class LiveAudioEngine implements AudioEngine {
   }
 
   /**
-   * Per frame, allocation-free: one world-matrix update, then position + forward (-Z) + up (+Y) read straight from
-   * the matrix columns. While IWSDK's three AudioListener (on the XR head) drives the shared context's listener, only
-   * the pose is cached (stereo fallback pans) — two writers would interleave their ramps a frame apart and wobble
-   * the HRTF image during head turns. Otherwise the AudioParams are written, skipping writes when the head is still.
+   * Per frame. While IWSDK's three AudioListener (on the XR head) drives the shared context's listener — the game in
+   * XR — the engine must not write it too (two writers would interleave their ramps a frame apart and wobble the HRTF
+   * image during head turns): it only remembers the head and reads its pose when a positional sound starts, so this
+   * costs a parent walk and two field stores. Otherwise the engine writes the listener AudioParams from the head's
+   * world matrix (skipped while the head is still). The matrix is the one the renderer keeps current: calling
+   * updateWorldMatrix on an IWSDK entity recomposes it and allocates every frame (measured ~0.15 KB).
    */
   setListener(head: Object3D): void {
     const impl = this.impl;
     if (!impl || !head) return;
     try {
-      head.updateWorldMatrix(true, false);
-      const m = head.matrixWorld.elements;
-      const ux = m[4], uy = m[5], uz = m[6];
-      const bx = m[8], by = m[9], bz = m[10];
-      const ul = Math.sqrt(ux * ux + uy * uy + uz * uz) || 1;
-      const bl = Math.sqrt(bx * bx + by * by + bz * bz) || 1;
-      const own = !this.threeListenerDrives(head);
-      this.owner = own ? 'engine' : 'three';
-      impl.setListenerPose(m[12], m[13], m[14], -bx / bl, -by / bl, -bz / bl, ux / ul, uy / ul, uz / ul, false, own);
+      if (this.threeListenerDrives(head)) {
+        this.owner = 'three';
+        impl.core.followListener(head);
+      } else {
+        this.owner = 'engine';
+        impl.core.setListenerMatrix(head.matrixWorld.elements, true);
+      }
     } catch (e) {
       warnOnce('setListener failed', e);
     }
   }
 
-  /** Is a three AudioListener on our context attached to the scene `head` lives in? (rescanned every 2 s) */
+  /** Is a three AudioListener on our context attached to the scene `head` lives in? (rescanned every ~2 s of calls) */
   private threeListenerDrives(head: Object3D): boolean {
     let root: Object3D = head;
     while (root.parent) root = root.parent;
-    const now = performance.now();
-    if (root === this.scanRoot && now - this.listenerScanAt < LISTENER_SCAN_MS) return this.threeListener !== null;
+    // counted in calls, not read from a clock: performance.now() hands back a fresh boxed number every frame
+    if (root === this.scanRoot && ++this.scanCalls < LISTENER_SCAN_CALLS) return this.threeListener !== null;
     this.scanRoot = root;
-    this.listenerScanAt = now;
+    this.scanCalls = 0;
     this.threeListener = this.findListener(root);
     return this.threeListener !== null;
   }
@@ -612,12 +719,20 @@ const registry = new WeakMap<AudioEngine, LiveAudioEngine>();
 export function createAudioEngine(): AudioEngine {
   const e = new LiveAudioEngine();
   registry.set(e, e);
-  try {
-    (globalThis as { __audio?: AudioDebug }).__audio = e.debug; // QA handle: the most recent engine
-  } catch {
-    /* frozen global: QA only */
-  }
+  publishInfo(e.info);
   return e;
+}
+
+/**
+ * `globalThis.__audio` = the most recent engine's read-only info: a non-writable property holding a frozen object
+ * of getters (configurable only so the next engine, or a hot reload, can take the name over).
+ */
+function publishInfo(info: AudioDebugInfo): void {
+  try {
+    Object.defineProperty(globalThis, '__audio', { value: info, writable: false, enumerable: true, configurable: true });
+  } catch {
+    /* a locked-down global: QA only */
+  }
 }
 
 /** Debug/QA access to an engine created by `createAudioEngine` (null for anything else). */

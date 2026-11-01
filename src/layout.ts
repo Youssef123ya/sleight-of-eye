@@ -1,7 +1,7 @@
 // Seated stage layout (owned by the lead). All positions are RIG-LOCAL metres:
 // origin = the player's calibrated eye position, +Y up, -Z forward (head yaw only, level).
 // Angles in the comments are measured from the eye (pitch = vertical, yaw = horizontal).
-import { Group, Quaternion, Vector3, type Object3D, type World } from '@iwsdk/core';
+import { Group, Matrix4, Quaternion, Vector3, type Object3D, type World } from '@iwsdk/core';
 
 export type V3 = readonly [number, number, number];
 
@@ -10,18 +10,20 @@ const TABLE_Y = -0.3;
 export const L = {
   tableY: TABLE_Y, // tabletop surface
   table: { centerZ: -0.55, width: 1.1, depth: 0.85 }, // spans z -0.125 .. -0.975
-  mat: { center: [0, TABLE_Y + 0.003, -0.4] as V3, size: [0.36, 0.24] as const }, // ≈ -37° pitch
+  // ≈ -37° pitch. The velvet mat is 6 mm thick: anything drawn "on the mat" (cones, spotlight, volunteer feet)
+  // goes at or above `top`.
+  mat: { center: [0, TABLE_Y + 0.003, -0.4] as V3, size: [0.36, 0.24] as const, top: TABLE_Y + 0.006 },
   propMarks: {
     coin: [0, TABLE_Y + 0.006, -0.4] as V3,
     ball: [0, TABLE_Y + 0.006, -0.38] as V3,
-    cupLeft: [-0.095, TABLE_Y + 0.006, -0.42] as V3,
-    cupMid: [0, TABLE_Y + 0.006, -0.42] as V3,
-    cupRight: [0.095, TABLE_Y + 0.006, -0.42] as V3,
+    cupLeft: [-0.085, TABLE_Y + 0.006, -0.45] as V3,
+    cupMid: [0, TABLE_Y + 0.006, -0.45] as V3,
+    cupRight: [0.085, TABLE_Y + 0.006, -0.45] as V3,
     watch: [0, TABLE_Y + 0.006, -0.39] as V3,
-    // front-left of the mat: clear of the cup circles, easy to reach blind, inside the glasses frustum on any glance
-    cupcake: [-0.06, TABLE_Y + 0.006, -0.335] as V3,
+    // Rear-left in Act III: the whole box stays in view on gadget glances, with clearance from the watch.
+    cupcake: [-0.06, TABLE_Y + 0.006, -0.45] as V3,
   },
-  volunteerSpot: [0.1, TABLE_Y + 0.004, -0.33] as V3, // a kit hops here for the ear reveal
+  volunteerSpot: [0.1, TABLE_Y + 0.006, -0.33] as V3, // a kit hops here for the ear reveal (on the mat top)
   riser: { z: -0.66, topY: TABLE_Y + 0.04, width: 0.5, depth: 0.12 },
   // 5 seats, feet on the riser; heads ≈ -13° pitch, yaw within ±15°
   seats: [
@@ -71,6 +73,10 @@ export class StageRig {
   private calibrated = false;
   private readonly tmpQ = new Quaternion();
   private readonly tmpV = new Vector3();
+  // The rig only moves on (re)calibration, so rig↔world conversions use cached matrices: calling
+  // localToWorld/worldToLocal on an IWSDK entity root recomposes its transform and allocates every call.
+  private readonly toWorldM = new Matrix4();
+  private readonly toLocalM = new Matrix4();
 
   constructor(world: World) {
     this.root = new Group();
@@ -91,6 +97,8 @@ export class StageRig {
     this.root.quaternion.setFromAxisAngle(this.tmpV.set(0, 1, 0), yaw);
     this.forward.set(0, 0, -1).applyQuaternion(this.root.quaternion);
     this.root.updateMatrixWorld(true);
+    this.toWorldM.copy(this.root.matrixWorld);
+    this.toLocalM.copy(this.toWorldM).invert();
     this.calibrated = true;
   }
 
@@ -104,15 +112,15 @@ export class StageRig {
     this.calibrateAt(pos, yaw);
   }
 
-  /** Rig-local point → world point (writes into `out`). */
+  /** Rig-local point → world point (writes into `out`; allocation-free). */
   toWorld(p: V3 | Vector3, out: Vector3): Vector3 {
     if (p instanceof Vector3) out.copy(p);
     else out.set(p[0], p[1], p[2]);
-    return this.root.localToWorld(out);
+    return out.applyMatrix4(this.toWorldM);
   }
 
-  /** World point → rig-local point (writes into `out`). */
+  /** World point → rig-local point (writes into `out`; allocation-free). */
   toLocal(p: Vector3, out: Vector3): Vector3 {
-    return this.root.worldToLocal(out.copy(p));
+    return out.copy(p).applyMatrix4(this.toLocalM);
   }
 }

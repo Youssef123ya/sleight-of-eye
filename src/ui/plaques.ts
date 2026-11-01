@@ -2,6 +2,8 @@
 // toward the player. ALL plaques share ONE merged mesh (faces + frames + easel legs) animated per slot with
 // uniform arrays (pop-in scale, hover lift, press, lit crossfade) → 1 draw call, +1 additive hover halo.
 // Each plaque is also a named Group 'plaque-<action>' (poke + gaze target) parented to its anchor.
+// Plaques never move in rig space (only the rig moves, on calibration), so slot matrices and poke/gaze centres are
+// computed once per layout and converted to world space with the allocation-free rig frame on every query.
 import {
   AdditiveBlending,
   BoxGeometry,
@@ -168,6 +170,8 @@ interface Slot {
   group: Group;
   /** rig-space lift so the frame never sinks into the tabletop (anchors that sit low) */
   lift: Vector3;
+  /** rig-local poke/gaze centre: 8 mm in front of the face centre (cached per layout) */
+  center: Vector3;
   hoverSide: Record<Side, boolean>;
   hover: number;
   press: Spring;
@@ -344,6 +348,7 @@ export class Plaques {
         own: p.own,
         group: g,
         lift: new Vector3(),
+        center: new Vector3(),
         hoverSide: { left: false, right: false },
         hover: 0,
         press: new Spring(0, 900, 30),
@@ -360,6 +365,7 @@ export class Plaques {
     this.updateSlotMatrices();
     this.liftAboveTable();
     this.updateSlotMatrices();
+    this.updateCenters();
     this.drawAtlas();
     this.buildMeshes();
     for (const s of this.slots) this.register(s);
@@ -501,13 +507,9 @@ export class Plaques {
   // ---------------------------------------------------------------------------------- registration
   private register(s: Slot): void {
     const id = `plaque-${s.action}`;
-    const getWorldPosition = (out: Vector3): Vector3 => {
-      s.group.getWorldPosition(out);
-      const e = s.group.matrixWorld.elements;
-      _v2.set(e[8], e[9], e[10]).normalize();
-      return out.addScaledVector(_v2, 0.008);
-    };
-    const enabled = () => this.group.visible && s.leaving < 0 && s.appear > 0.25;
+    // queried ~10×/frame by the gaze + poke registries: cached rig-local centre → world (plain arithmetic)
+    const getWorldPosition = (out: Vector3): Vector3 => this.ctx.frame.toWorld(s.center, out);
+    const enabled = () => this.ctx.root.visible && this.group.visible && s.leaving < 0 && s.appear > 0.25;
     try {
       s.offs.push(
         this.deps.pokes.add({
@@ -547,7 +549,32 @@ export class Plaques {
     else s.hoverSide.right = what === 'hover';
   }
 
+  /** Re-read the anchors (event time: entering XR, layout changes). Plaques do not move in rig space. */
+  refresh(): void {
+    if (!this.slots.length) return;
+    this.updateSlotMatrices();
+    this.updateCenters();
+  }
+
+  /** Pop the plaques in again (staggered), e.g. when the immersive session becomes visible. */
+  replayIntro(): void {
+    for (let i = 0; i < this.slots.length; i++) {
+      const s = this.slots[i];
+      if (s.leaving < 0) s.appear = -0.12 - i * 0.07;
+    }
+  }
+
+  /** Poke/gaze centres (rig-local) from the slot matrices: face centre + 8 mm along the face normal. */
+  private updateCenters(): void {
+    for (let i = 0; i < this.slots.length; i++) {
+      const e = this.slotMats[i].elements;
+      _v2.set(e[8], e[9], e[10]).normalize();
+      this.slots[i].center.set(e[12], e[13], e[14]).addScaledVector(_v2, 0.008);
+    }
+  }
+
   // ------------------------------------------------------------------------------------------ frame
+  /** Slot matrices (rig-local) from the anchors' world matrices. Event time only: it recomposes the chain. */
   private updateSlotMatrices(): void {
     this.group.updateWorldMatrix(true, false);
     _rootInv.copy(this.group.matrixWorld).invert();
@@ -565,7 +592,6 @@ export class Plaques {
   update(dt: number): void {
     this.time += dt;
     if (!this.mesh || !this.slots.length) return;
-    this.updateSlotMatrices();
     const u = this.mat.uniforms;
     const scale = u.uScale.value as number[];
     const hover = u.uHover.value as number[];

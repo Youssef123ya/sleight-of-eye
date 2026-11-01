@@ -30,6 +30,7 @@ export default async function catchPath(page, api) {
     check(!!caught && /^kit[123]$/.test(caught.data.by) && caught.data.prop === 'coin', "'caught' event names a kit and the coin", caught?.data);
     check(s.alarm === caught?.data.by, "the catcher's sight cone flashes (alarm)", { alarm: s.alarm });
     check(s.palmed === null && s.caught === 1, 'nothing palmed; one catch counted', { palmed: s.palmed, caught: s.caught });
+    check(s.said.includes('fox: I SAW THAT!'), 'the catcher shouts "I SAW THAT!" (capitals: the animalese shout)', { said: s.said });
     await page.waitForTimeout(300);
     await api.shot('core-catch-caught');
     await pinch(0, 0.25);

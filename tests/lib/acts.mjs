@@ -1,14 +1,15 @@
 // tests/lib/acts.mjs — data-driven act playthroughs (owned by Q), shared by tests/scenarios/act1..3.mjs.
 //
 // The game is written in parallel, so the driver is written against the contracts and spec §7 rather than a fixed
-// beat list: it reads window.__app.debugState() ({ act, beat, beatKind, caught, palmed, loaded, gazeTarget, watchers,
-// calibrated, paused, stars }), runs the handler for the current beatKind (intro, demo, show, steal, load, lookBack,
-// reveal, bow), waits for the beat to change, and repeats. A beat that does not advance is reported with the last
-// state and a screenshot, then skipped with skipTo() so one broken beat never hides the rest of the act.
+// beat list: it reads window.__app.debugState() ({ act, beat, beatKind, phase, caught, alarm, palmed, loaded,
+// gazeTarget, watchers, calibrated, paused, stars }), runs the handler for the current beatKind (intro, demo, show,
+// steal, load, lookBack, reveal, bow), waits for the beat to change, and repeats. A beat that does not advance is
+// reported with the last state and a screenshot, then skipped with skipTo() so one broken beat never hides the rest.
 //
 // Two paths per act:
 //   success — misdirect with the act's gadget(s), steal unseen, load, look back, reveal → act complete, 0 catches.
-//   catch   — steal while the audience watches the mat → caught increments, the beat rewinds (prop back home, not
+//   catch   — steal while the audience watches the mat → caught increments and the beat holds (phase 'caught', the
+//             catcher's alarm set), then really rewinds (same beat kind, phase 'active', alarm null, prop not
 //             palmed), then misdirect and steal again to prove the rewind is recoverable (spec pillar 3).
 import path from 'node:path';
 import * as qa from './iwer.mjs';
@@ -47,6 +48,9 @@ export const ACTS = {
 };
 
 const BEAT_TIMEOUT = { intro: 14, demo: 26, show: 10, steal: 10, load: 8, lookBack: 10, reveal: 10, bow: 4 };
+// A catch holds the beat in phase 'caught' for CFG.catchCaptionTime (1.6 s) + half the 0.7 s rewind smear, then
+// restores the checkpoint (src/game/tricks.ts caught()). Allow for slow headless frames.
+const REWIND_TIMEOUT_MS = 6000;
 
 const caughtValue = (s) => (typeof s?.caught === 'number' ? s.caught : s?.caught ? JSON.stringify(s.caught) : 0);
 const caughtSince = (base, s) =>
@@ -56,9 +60,43 @@ const actDone = (s, act) =>
   !!s && ((Array.isArray(s.stars) && Number(s.stars[act - 1]) > 0) || Number(s.act) > act || String(s.beatKind).toLowerCase() === 'bow');
 const beatKey = (s) => `${s?.act}:${s?.beat}:${s?.beatKind}`;
 const kindOf = (s) => String(s?.beatKind ?? 'unknown');
+/**
+ * The catch really rewound: the same beat kind is running again (phase 'active', not 'caught'), the catcher's alarm
+ * is cleared and the prop is not palmed. Same kind + not palmed alone is already true during the ~2 s 'caught'
+ * phase, before anything rewinds, so phase and alarm (both in debugState) are required.
+ */
+const rewoundTo = (s, prop) => (st) => kindOf(st) === kindOf(s) && st.phase === 'active' && st.alarm === null && !holds(st.palmed, prop);
+const brief = (st) => (st ? `beat ${st.beat} ${st.beatKind}, phase ${st.phase}, alarm ${st.alarm}, palmed ${JSON.stringify(st.palmed)}` : 'no state');
+
+/** Wait for the beat to rewind after a catch seen at `caughtAt` (ms). Resolves { state | null, last, seconds }. */
+async function waitRewind(ctx, s, prop, caughtAt) {
+  let state = null;
+  let last = null;
+  try {
+    state = await qa.waitForState(ctx.page, rewoundTo(s, prop), { timeout: REWIND_TIMEOUT_MS, label: 'rewind after the catch' });
+  } catch (e) {
+    last = e.details?.state ?? (await qa.appState(ctx.page).catch(() => null));
+  }
+  return { state, last, seconds: (Date.now() - caughtAt) / 1000 };
+}
+
+function rewindStep(ctx, rw) {
+  return ctx.step(
+    'steal',
+    'beat rewinds (no penalty)',
+    !!rw.state,
+    rw.state ? `${rw.seconds.toFixed(1)} s after the catch: ${brief(rw.state)}` : `not rewound ${rw.seconds.toFixed(1)} s after the catch (last: ${brief(rw.last)})`,
+  );
+}
+
+/** Report name: act<N>, or act<N>-<tag> (--tag keeps e.g. a fixture selftest apart from the real game's report). */
+export const reportName = (act, tag) => {
+  const t = String(tag ?? '').replace(/[^a-z0-9_-]+/gi, '');
+  return t ? `act${act}-${t}` : `act${act}`;
+};
 
 /** Context for one path: page, logging, screenshots, failures. */
-function makeCtx(page, { act, path: pathName, side, shots, outDir }) {
+function makeCtx(page, { act, path: pathName, side, shots, outDir, name = `act${act}` }) {
   const ctx = {
     page,
     act,
@@ -71,9 +109,9 @@ function makeCtx(page, { act, path: pathName, side, shots, outDir }) {
     t0: Date.now(),
     async shot(label) {
       if (!shots) return null;
-      const name = `${String(++ctx.shotIdx).padStart(2, '0')}-${label.replace(/[^a-z0-9-]+/gi, '_')}.png`;
+      const file = `${String(++ctx.shotIdx).padStart(2, '0')}-${label.replace(/[^a-z0-9-]+/gi, '_')}.png`;
       try {
-        const p = await qa.screenshot(page, path.join(outDir, `act${act}-${pathName}`, name));
+        const p = await qa.screenshot(page, path.join(outDir, `${name}-${pathName}`, file));
         ctx.shots.push(p);
         return p;
       } catch {
@@ -180,19 +218,18 @@ const HANDLERS = {
       const r = await qa.pinchAt(ctx.page, ctx.side, plan.prop, { hold: 0.2 });
       ctx.step('steal', `pinch-palm ${plan.prop} in plain sight`, r.ok, r.result?.error ?? `${r.selects} selectstart`);
       const caught = await qa.waitForState(ctx.page, (st) => caughtSince(base, st), { timeout: 4000, throws: false });
+      const caughtAt = Date.now();
       await ctx.shot('caught');
       ctx.step('steal', '"I SAW THAT!" (caught increments)', !!caught, caught ? `caught ${JSON.stringify(caught.caught)}` : 'no catch registered');
       ctx.caughtOnce = true;
       if (!caught) return { advanced: await waitAdvance(ctx, s, 1), abort: true };
-      // rewind: same beat kind again, prop not palmed
-      const rewound = await qa.waitForState(
-        ctx.page,
-        (st) => kindOf(st) === kindOf(s) && !holds(st.palmed, plan.prop),
-        { timeout: 4000, throws: false },
-      );
+      // the catch is visible: the runner holds the beat ('caught' phase) while the catcher's sight cone flashes
+      ctx.step('steal', "caught phase: the beat holds, the catcher's cone flashes", caught.phase === 'caught' && caught.alarm != null, brief(caught));
+      // rewind: the same beat kind running again (phase 'active'), alarm cleared, prop not palmed
+      const rw = await waitRewind(ctx, s, plan.prop, caughtAt);
       await ctx.shot('rewound');
-      ctx.step('steal', 'beat rewinds (no penalty)', !!rewound, rewound ? `beat ${rewound.beat} ${rewound.beatKind}, palmed ${rewound.palmed}` : 'beat did not rewind');
-      if (!rewound) return { advanced: await waitAdvance(ctx, s, 1), abort: true };
+      rewindStep(ctx, rw);
+      if (!rw.state) return { advanced: await waitAdvance(ctx, s, 1), abort: true };
       return { advanced: null, retry: true }; // the driver re-reads the state and runs the success steal
     }
     await misdirect(ctx, plan);
@@ -204,7 +241,10 @@ const HANDLERS = {
     });
     await ctx.shot(`stole-${plan.prop}`);
     if (palmed && caughtSince(base, palmed)) {
-      ctx.step('steal', `${plan.prop} palmed unseen`, false, `caught while stealing (watchers ${palmed.watchers})`);
+      const caughtAt = Date.now();
+      ctx.step('steal', `${plan.prop} palmed unseen`, false, `caught while stealing (watchers ${palmed.watchers}, by ${palmed.alarm ?? '?'})`);
+      // retry only once the beat has really rewound (pinches are ignored during the 'caught' phase)
+      rewindStep(ctx, await waitRewind(ctx, s, plan.prop, caughtAt));
       return { advanced: null, retry: true };
     }
     ctx.step('steal', `${plan.prop} palmed unseen`, !!palmed, palmed ? `palmed ${JSON.stringify(palmed.palmed)}` : 'palmed never set');
@@ -306,9 +346,9 @@ async function discoverBeat(page, act, kind, maxBeat = 14) {
 }
 
 /** Play one act along one path on an XR-ready page. */
-export async function playActPath(page, act, pathName, { side = 'right', shots = true, outDir = qa.outPath('scenarios'), maxBeats = 16 } = {}) {
+export async function playActPath(page, act, pathName, { side = 'right', shots = true, outDir = qa.outPath('scenarios'), maxBeats = 16, name } = {}) {
   const plan = ACTS[act];
-  const ctx = makeCtx(page, { act, path: pathName, side, shots, outDir });
+  const ctx = makeCtx(page, { act, path: pathName, side, shots, outDir, name: name ?? reportName(act) });
   try {
     if (pathName === 'catch') {
       const b = await discoverBeat(page, act, 'steal');
@@ -395,15 +435,17 @@ function finish(ctx, end) {
 /**
  * Standalone runner for tests/scenarios/act<N>.mjs:
  *   node tests/scenarios/act1.mjs [--url=http://127.0.0.1:8081/] [--demo=debug] [--paths=success,catch]
- *        [--hand=right|left] [--easy] [--no-shots] [--require-app] [--timeout=240]
+ *        [--hand=right|left] [--easy] [--no-shots] [--require-app] [--tag=<name>] [--timeout=240]
+ * Report: tests/out/scenarios/act<N>[-<tag>].json + .md, screenshots in tests/out/scenarios/act<N>[-<tag>]-<path>/.
  * Exit 0 = pass (or skipped: no window.__app), 1 = a path failed, 2 = could not run.
  */
 export async function runActCli(act) {
   const args = qa.parseArgs();
   const timeoutS = Number(args.timeout ?? 240);
   qa.installWatchdog(timeoutS * 1000, `act${act} scenario`);
-  const res = await runAct(act, args).catch((e) => ({ act, status: 'error', error: String(e?.stack ?? e) }));
-  qa.writeJson(qa.outPath('scenarios', `act${act}.json`), res);
+  const name = reportName(act, args.tag);
+  const res = await runAct(act, args).catch((e) => ({ act, name, status: 'error', error: String(e?.stack ?? e) }));
+  qa.writeJson(qa.outPath('scenarios', `${name}.json`), res);
   console.log(JSON.stringify(summarize(res), null, 2));
   process.exit(res.status === 'pass' || res.status === 'skip' ? 0 : res.status === 'fail' ? 1 : 2);
 }
@@ -414,6 +456,7 @@ export async function runAct(act, args = {}) {
   const paths = String(args.paths ?? 'success,catch').split(',').filter(Boolean);
   const side = args.hand === 'left' ? 'left' : 'right';
   const shots = args.shots !== false;
+  const name = reportName(act, args.tag);
   const browser = await qa.launchBrowser();
   const results = [];
   const errors = [];
@@ -424,13 +467,13 @@ export async function runAct(act, args = {}) {
       try {
         if (!(await qa.hasApp(app.page, { timeout: Number(args.appWait ?? 20) * 1000 }))) {
           await app.close();
-          return { act, status: args['require-app'] ? 'fail' : 'skip', reason: `no window.__app at ${url}`, url, results };
+          return { act, name, status: args['require-app'] ? 'fail' : 'skip', reason: `no window.__app at ${url}`, url, results };
         }
         await qa.enterXR(app.page, { fov: 60, head: qa.DEFAULT_EYE, look: [0, 1.2, -1] });
         await qa.waitForState(app.page, (s) => s.calibrated !== false, { timeout: 5000, throws: false });
         if (args.easy) await qa.callApp(app.page, 'setSettings', { easyAudience: true }).catch(() => {});
         await qa.lookAt(app.page, 'mat').catch(() => {});
-        const r = await playActPath(app.page, act, p, { side, shots });
+        const r = await playActPath(app.page, act, p, { side, shots, name });
         r.consoleErrors = [...qa.consoleErrors(app.page)];
         if (r.consoleErrors.length) {
           r.ok = false;
@@ -448,8 +491,8 @@ export async function runAct(act, args = {}) {
   } finally {
     await browser.close().catch(() => {});
   }
-  const res = { act, title: ACTS[act].title, status, url, side, results, errors };
-  qa.writeText(qa.outPath('scenarios', `act${act}.md`), actMarkdown(res));
+  const res = { act, name, title: ACTS[act].title, status, url, side, results, errors };
+  qa.writeText(qa.outPath('scenarios', `${name}.md`), actMarkdown(res));
   return res;
 }
 
@@ -461,7 +504,7 @@ export function summarize(res) {
     url: res.url,
     errors: res.errors,
     paths: (res.results ?? []).map((r) => ({ path: r.path, ok: r.ok, seconds: r.seconds, failures: r.failures, end: r.end })),
-    report: qa.relOut(qa.outPath('scenarios', `act${res.act}.md`)),
+    report: qa.relOut(qa.outPath('scenarios', `${res.name ?? reportName(res.act)}.md`)),
   };
 }
 

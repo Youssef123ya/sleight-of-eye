@@ -4,7 +4,7 @@
 import type { BufferGeometry } from '@iwsdk/core';
 import type { SpectatorAnchor, SpectatorKind } from '../../contracts.js';
 import { PuppetBuilder, add, alignY, alignZ, norm, onEllipsoid, prim, yawPitch, type BoneDef, type V3 } from '../builder.js';
-import { DEG } from '../math.js';
+import { DEG, settleFields } from '../math.js';
 
 export interface Traits {
   /** Head-spring speed multiplier (1 = CFG). */
@@ -61,6 +61,9 @@ export const DEFAULT_TRAITS: Traits = {
   hop: 1,
   wings: false,
 };
+// Every design spreads DEFAULT_TRAITS, so all traits objects share its hidden class. Settle it at load: a design built
+// mid-show (the magpie in Act II, Brock in Act III) must not change that shape under the optimised puppet code.
+settleFields(DEFAULT_TRAITS);
 
 /** Felt looks a touch dark under the matcap + ACES; a small gain keeps the palette honest. */
 export const FELT_GAIN = 1.1;

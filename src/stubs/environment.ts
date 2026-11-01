@@ -606,17 +606,18 @@ class StubCafe implements Cafe {
     parts.push({ geometry: new BoxGeometry(0.004, 0.09, dpt), color: 0x6e1f1c, position: [w / 2 + 0.008, ty - 0.045, L.table.centerZ] });
     this.add(new Mesh(mergeParts(parts), felt), 'table');
 
-    // green velvet close-up mat with chalk marks
+    // green velvet close-up mat (6 mm: its top is L.mat.top, where the props stand) with chalk marks
+    const matH = L.mat.top - ty;
     const matParts: Part[] = [
-      { geometry: new BoxGeometry(L.mat.size[0], 0.005, L.mat.size[1]), color: PAL.velvet, position: [L.mat.center[0], ty + 0.0025, L.mat.center[2]] },
-      { geometry: new BoxGeometry(L.mat.size[0] + 0.012, 0.004, L.mat.size[1] + 0.012), color: PAL.velvetDeep, position: [L.mat.center[0], ty + 0.002, L.mat.center[2]] },
+      { geometry: new BoxGeometry(L.mat.size[0], matH, L.mat.size[1]), color: PAL.velvet, position: [L.mat.center[0], ty + matH / 2, L.mat.center[2]] },
+      { geometry: new BoxGeometry(L.mat.size[0] + 0.012, matH - 0.001, L.mat.size[1] + 0.012), color: PAL.velvetDeep, position: [L.mat.center[0], ty + (matH - 0.001) / 2, L.mat.center[2]] },
     ];
     const chalkRing = new RingGeometry(0.019, 0.022, 36);
     chalkRing.rotateX(-Math.PI / 2);
     for (const id of ['coin', 'cupLeft', 'cupMid', 'cupRight'] as PropId[]) {
       const m = L.propMarks[id];
       const s = id === 'coin' ? 1 : 1.45;
-      matParts.push({ geometry: chalkRing, color: PAL.chalk, position: [m[0], ty + 0.0052, m[2]], scale: [s, 1, s] });
+      matParts.push({ geometry: chalkRing, color: PAL.chalk, position: [m[0], L.mat.top + 0.0002, m[2]], scale: [s, 1, s] });
     }
     this.add(new Mesh(mergeParts(matParts), matcapMaterial('velvet')), 'mat');
 
@@ -663,7 +664,7 @@ class StubCafe implements Cafe {
     this.poolMat = new MeshBasicMaterial({ map: glowTexture(), color: PAL.lampAmber, transparent: true, opacity: 0.32, blending: AdditiveBlending, depthWrite: false, toneMapped: false });
     const pool = new Mesh(new CircleGeometry(0.42, 40), this.poolMat);
     pool.rotation.x = -Math.PI / 2;
-    pool.position.set(0, ty + 0.0062, -0.47);
+    pool.position.set(0, L.mat.top + 0.0004, -0.47); // over the mat's top (and the chalk marks on it)
     pool.renderOrder = 2;
     this.add(pool, 'lampPool');
   }

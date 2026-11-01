@@ -1,6 +1,9 @@
-// Close-up props: coin, felt ball, three copper cups, Brock's pocket watch, the cupcake box.
-// Each prop = root (the game writes its pose) → pivot (our animations) → meshes. Glints and contact shadows are
-// slots in the shared GlowBatch / BlobBatch, updated from the prop's world pose every frame.
+// Close-up props: coin, the shiny lacquered ball, three copper cups, Brock's pocket watch, the cupcake box.
+// Each prop = root (the game writes its pose) → pivot (faces the player) → lifter (our animations) → meshes. Glints and
+// contact shadows are slots in the shared GlowBatch / BlobBatch, updated from the prop's pose every frame.
+// Per-frame safe: pivot, lifter, cupcake lid and second hand have matrixAutoUpdate off and get their matrices written
+// with plain arithmetic (util.writeTRS); the decal position comes from the CURRENT local transforms (util.affineTo),
+// never from getWorldPosition/worldToLocal, which recompose the IWSDK rig entity and allocate on every call.
 import {
   BoxGeometry,
   CircleGeometry,
@@ -8,30 +11,57 @@ import {
   Group,
   IcosahedronGeometry,
   Mesh,
-  MeshBasicMaterial,
   Object3D,
   SphereGeometry,
   TorusGeometry,
   Vector3,
   type BufferGeometry,
   type Material,
+  type MeshMatcapMaterial,
 } from '@iwsdk/core';
 import type { Glint, Prop, PropAnimation, PropId } from '../contracts.js';
 import { mergeParts, type Part } from '../art/geometry.js';
+import type { MatcapSpec } from '../art/matcap.js';
 import { PAL } from '../art/palette.js';
 import { L, type StageRig } from '../layout.js';
 import type { FxImpl } from './fx.js';
 import { MODE, type BlobBatch, type GlowBatch } from './glow.js';
+import { surfaceMaterial } from './surface.js';
 import { CELL, makeDialTexture } from './textures.js';
-import { TAU, clamp01, easeInBack, easeInCubic, easeOutBack, easeOutCubic, lathe, lin, smoothstep, starPlate } from './util.js';
+import {
+  TAU,
+  affineTo,
+  clamp01,
+  easeInBack,
+  easeInCubic,
+  easeOutBack,
+  easeOutCubic,
+  ensureColor,
+  freezeMatrix,
+  lathe,
+  lin,
+  smoothstep,
+  starPlate,
+  writeRotX,
+  writeRotY,
+  writeTRS,
+  type FrameClock,
+} from './util.js';
 
+/** All on the café's shared surface program (surface.ts). */
 export interface PropMaterials {
-  metal: Material; // brass matcap, vertex coloured (coin, watch case)
-  copper: Material; // warm copper matcap (cups)
-  felt: Material; // felt matcap (ball, cupcake, box)
-  dial: Material;
-  hand: Material;
+  metal: MeshMatcapMaterial; // brass matcap, vertex coloured (coin, watch case)
+  copper: MeshMatcapMaterial; // warm copper matcap (cups)
+  felt: MeshMatcapMaterial; // felt matcap + fibre speckle (cupcake box)
+  lacquer: MeshMatcapMaterial; // glossy red lacquer: the shiny ball the magpie stares at
+  dial: MeshMatcapMaterial; // unlit dial texture
+  hand: MeshMatcapMaterial; // unlit vertex colours (second hand)
 }
+
+/** Deep red lacquer with a hot white specular dot: the ball has to read as shiny (the magpie's rule). */
+export const LACQUER_MATCAP: MatcapSpec = {
+  base: 0xb0201a, key: 0xff7a60, keyStrength: 0.55, rim: 0xff6a50, rimStrength: 0.35, rimPower: 2.4, spec: 1.7, specSize: 0.14,
+};
 
 export interface PropEnv {
   rig: StageRig;
@@ -46,6 +76,9 @@ const GOLD = lin(PAL.glintGold);
 const BLUE = lin(PAL.glintBlue);
 const TARGET = lin(PAL.target);
 const MAT_HALF = [L.mat.size[0] / 2, L.mat.size[1] / 2] as const;
+/** Contact shadows / target rings on the velvet sit just above its top; on the cloth just above the tabletop. */
+const ON_MAT_Y = L.mat.top + 0.0003;
+const ON_CLOTH_Y = L.tableY + 0.0012;
 
 interface AnimState {
   kind: PropAnimation;
@@ -55,13 +88,10 @@ interface AnimState {
   resolve: (() => void) | null;
 }
 
-const v1 = new Vector3();
-const v2 = new Vector3();
-
 export class PropImpl implements Prop {
   readonly root = new Group();
   readonly pivot = new Group();
-  /** Cups: lifts + tilts inside the facing pivot. */
+  /** Lifts / tilts / squashes inside the facing pivot (manual matrix). */
   private readonly lifter = new Group();
   readonly home: Vector3;
   lid: Object3D | null = null;
@@ -81,7 +111,21 @@ export class PropImpl implements Prop {
   private squash = 0;
   private now = 0;
   private readonly baseYaw: number;
+  private pivotYaw = 0;
+  private readonly lidPos = new Vector3();
+  private handY = 0;
   private readonly origParent: Object3D | null = null;
+  private readonly m = new Float64Array(12);
+  private readonly tmp = new Vector3();
+  private readonly lp = new Float64Array(8).fill(Number.NaN);
+  private readonly blobApplied = new Float64Array(7).fill(Number.NaN);
+  private lidApplied = Number.NaN;
+  private handApplied = Number.NaN;
+  private gx = 0;
+  private gy = 0;
+  private gz = 0;
+  private gSurf = 0;
+  private gTop = 0;
 
   constructor(
     readonly id: PropId,
@@ -93,27 +137,44 @@ export class PropImpl implements Prop {
     parent: Object3D,
     private readonly blobSize: [number, number, number],
   ) {
-    const m = L.propMarks[id];
-    this.home = new Vector3(m[0], m[1], m[2]);
+    const mk = L.propMarks[id];
+    this.home = new Vector3(mk[0], mk[1], mk[2]);
     this.root.name = id;
     this.pivot.name = `${id}-pivot`;
     this.lifter.name = `${id}-lifter`;
+    this.pivot.matrixAutoUpdate = false;
+    this.lifter.matrixAutoUpdate = false;
     this.root.add(this.pivot);
     this.pivot.add(this.lifter);
-    this.lifter.rotation.order = 'YXZ';
     parent.add(this.root);
     this.origParent = parent;
     // face the player's eye (rig origin)
-    this.baseYaw = Math.atan2(-m[0], -m[2]);
-    this.pivot.rotation.y = this.baseYaw;
+    this.baseYaw = Math.atan2(-mk[0], -mk[2]);
     for (let i = 0; i < 5; i++) this.glintSlots.push(env.glow.alloc());
     this.blobSlot = env.blobs.alloc();
     this.reset();
   }
 
-  /** Content goes inside the lifter (so cup tilts, hovers and squashes apply). */
+  /** Content goes inside the lifter (so cup tilts, hovers and squashes apply). Add, then freezeMatrix() statics. */
   get content(): Group {
     return this.lifter;
+  }
+
+  /** Cupcake: the lid hinge (animated about X by the lift). */
+  attachLid(lid: Object3D): void {
+    this.lid = lid;
+    this.lidPos.copy(lid.position);
+    lid.matrixAutoUpdate = false;
+    this.pose();
+  }
+
+  /** Watch: the ticking second hand (animated about Y). */
+  attachSecondHand(hand: Object3D): void {
+    this.secondHand = hand;
+    this.handY = hand.position.y;
+    hand.matrixAutoUpdate = false;
+    this.handApplied = Number.NaN;
+    this.updateSecondHand();
   }
 
   setGlint(glint: Glint): void {
@@ -172,7 +233,7 @@ export class PropImpl implements Prop {
     this.root.quaternion.identity();
     this.root.scale.set(1, 1, 1);
     this.root.visible = true;
-    this.pivot.rotation.set(0, this.baseYaw, 0);
+    this.setPivotYaw(this.baseYaw);
     this.lift = 0;
     this.pop = 1;
     this.rise = 0;
@@ -185,6 +246,11 @@ export class PropImpl implements Prop {
   /** Lift state 0..1 (cups up / lid open). */
   get liftAmount(): number {
     return this.lift;
+  }
+
+  private setPivotYaw(yaw: number): void {
+    this.pivotYaw = yaw;
+    writeTRS(this.pivot, 0, 0, 0, 0, yaw, 0);
   }
 
   private finishAnim(): void {
@@ -204,22 +270,38 @@ export class PropImpl implements Prop {
     a.resolve?.();
   }
 
+  /** Watch: jump into the cupcake's frosting (opening the box if needed) before rising out of it. */
   private prepareRise(): void {
     const cc = this.cupcake;
     if (!cc?.frosting) return;
     if (cc.liftAmount < 0.9) void cc.animate('lift');
-    cc.frosting.getWorldPosition(v1);
-    if (this.root.parent) this.root.parent.worldToLocal(v1);
-    this.root.position.copy(v1);
+    const parent = this.root.parent;
+    const p = this.tmp;
+    if (parent && affineTo(cc.frosting, parent, this.m)) p.set(this.m[9], this.m[10], this.m[11]);
+    else {
+      // detached / foreign parent (never in the game): fall back to an exact world round trip (event time)
+      cc.frosting.getWorldPosition(p);
+      if (parent) parent.worldToLocal(p);
+    }
+    this.root.position.copy(p);
     this.root.quaternion.identity();
     this.root.visible = true;
     this.pop = 1;
-    this.pivot.rotation.set(0, Math.atan2(-v1.x, -v1.z), 0);
+    this.setPivotYaw(Math.atan2(-p.x, -p.z));
     this.lift = 0;
   }
 
-  update(dt: number, now: number): void {
-    this.now = now;
+  /** Per frame, driven by the café's clock (time arrives in fields, never as boxed call arguments). */
+  step(clock: FrameClock): void {
+    this.now = clock.now;
+    if (this.anim) this.advance();
+    this.pose();
+    if (this.secondHand) this.updateSecondHand();
+    this.updateDecals();
+  }
+
+  private advance(): void {
+    const now = this.now;
     const a = this.anim;
     if (a) {
       const t = clamp01((now - a.t0) / a.dur);
@@ -266,132 +348,200 @@ export class PropImpl implements Prop {
         a.resolve?.();
       }
     }
-    this.pose();
-    this.updateSecondHand(now);
-    this.updateDecals(now);
-    void dt;
   }
 
+  /** Lifter (and cupcake lid) matrices from the animation state; skipped while nothing changes (idle props). */
   private pose(): void {
-    const lf = this.lifter;
     const L1 = this.lift;
-    lf.position.set(0, 0, 0);
-    lf.rotation.set(0, 0, 0);
+    let px = 0;
+    let py = 0;
+    let pz = 0;
+    let rx = 0;
+    let ry = 0;
+    let rz = 0;
     switch (this.kind) {
       case 'cup':
-        lf.position.y = 0.062 * L1;
-        lf.position.z = 0.012 * L1;
-        lf.rotation.x = -0.72 * L1;
+        py = 0.062 * L1;
+        pz = 0.012 * L1;
+        rx = -0.72 * L1;
         break;
-      case 'cupcake':
-        if (this.lid) this.lid.rotation.x = -1.95 * L1;
+      case 'cupcake': {
+        const lid = this.lid;
+        const ax = -1.95 * L1;
+        if (lid && ax !== this.lidApplied) {
+          this.lidApplied = ax;
+          writeRotX(lid, this.lidPos.x, this.lidPos.y, this.lidPos.z, ax);
+        }
         break;
+      }
       case 'coin':
-        lf.position.y = 0.04 * L1;
-        lf.rotation.x = (Math.PI / 2) * Math.min(1, L1) * 0.92;
+        py = 0.04 * L1;
+        rx = (Math.PI / 2) * Math.min(1, L1) * 0.92;
         break;
       case 'watch': {
-        lf.position.y = 0.035 * L1;
-        lf.rotation.x = (Math.PI / 2) * Math.min(1, L1) * 0.85;
+        py = 0.035 * L1;
+        rx = (Math.PI / 2) * Math.min(1, L1) * 0.85;
         if (this.rise > 0) {
           const r = this.rise;
           const up = easeOutBack(Math.min(1, r * 1.1), 1.8);
-          lf.position.y = -0.028 + 0.1 * up + (r >= 1 ? 0.004 * Math.sin(this.now * 2.2) : 0);
-          lf.position.z = 0.004;
-          lf.rotation.x = (Math.PI / 2) * easeOutCubic(Math.min(1, r * 1.4));
-          lf.rotation.y = (1 - easeOutCubic(r)) * TAU * 1.25;
-          lf.rotation.z = r >= 1 ? 0.07 * Math.sin(this.now * 1.6) : 0;
+          py = -0.028 + 0.1 * up + (r >= 1 ? 0.004 * Math.sin(this.now * 2.2) : 0);
+          pz = 0.004;
+          rx = (Math.PI / 2) * easeOutCubic(Math.min(1, r * 1.4));
+          ry = (1 - easeOutCubic(r)) * TAU * 1.25;
+          rz = r >= 1 ? 0.07 * Math.sin(this.now * 1.6) : 0;
         }
         break;
       }
       case 'ball':
-        lf.position.y = 0.03 * L1;
+        py = 0.03 * L1;
         break;
     }
     if (this.wob >= 0) {
       const w = this.wob;
       const k = (1 - w) * (1 - w);
-      lf.rotation.z += 0.24 * Math.sin(w * Math.PI * 5) * k;
-      lf.rotation.x += 0.08 * Math.sin(w * Math.PI * 4 + 1) * k;
-      lf.position.y += 0.007 * Math.sin(w * Math.PI) * (1 - w);
+      rz += 0.24 * Math.sin(w * Math.PI * 5) * k;
+      rx += 0.08 * Math.sin(w * Math.PI * 4 + 1) * k;
+      py += 0.007 * Math.sin(w * Math.PI) * (1 - w);
     }
     const s = Math.max(0.0001, this.pop);
-    lf.scale.set(s * (1 - this.squash * 0.5), s * (1 + this.squash), s * (1 - this.squash * 0.5));
+    const sy = s * (1 + this.squash);
+    const sxz = s * (1 - this.squash * 0.5);
+    const P = this.lp;
+    if (px === P[0] && py === P[1] && pz === P[2] && rx === P[3] && ry === P[4] && rz === P[5] && sxz === P[6] && sy === P[7]) return;
+    P[0] = px;
+    P[1] = py;
+    P[2] = pz;
+    P[3] = rx;
+    P[4] = ry;
+    P[5] = rz;
+    P[6] = sxz;
+    P[7] = sy;
+    writeTRS(this.lifter, px, py, pz, rx, ry, rz, sxz, sy, sxz, true);
   }
 
-  private updateSecondHand(now: number): void {
+  private updateSecondHand(): void {
     const h = this.secondHand;
     if (!h) return;
+    const now = this.now;
     const sec = Math.floor(now);
     const f = now - sec;
     const settle = f < 0.16 ? Math.sin((f / 0.16) * Math.PI) * 0.12 * (1 - f / 0.16) : 0;
-    h.rotation.y = -((sec % 60) + Math.min(1, f / 0.06) - 1 + settle) * (TAU / 60);
+    const a = -((sec % 60) + Math.min(1, f / 0.06) - 1 + settle) * (TAU / 60);
+    if (a === this.handApplied) return; // the hand holds still ~3/4 of every second
+    this.handApplied = a;
+    writeRotY(h, 0, this.handY, 0, a);
   }
 
-  private updateDecals(now: number): void {
+  private hideDecals(): void {
     const glow = this.env.glow;
-    const visible = this.root.visible && this.pop > 0.02 && this.isShown();
-    // world → rig-local centre of the prop body
-    this.lifter.getWorldPosition(v1);
-    this.env.rig.root.worldToLocal(v1);
+    for (let i = 0; i < this.glintSlots.length; i++) glow.hide(this.glintSlots[i]);
+    this.env.blobs.hide(this.blobSlot);
+    this.blobApplied[0] = Number.NaN;
+  }
+
+  private updateDecals(): void {
+    if (!this.root.visible || this.pop <= 0.02 || !this.isShown() || !affineTo(this.lifter, this.env.rig.root, this.m)) {
+      this.hideDecals();
+      return;
+    }
+    // rig-local origin of the prop body (the lifter), exact for this frame
+    const ox = this.m[9];
+    const oy = this.m[10];
+    const oz = this.m[11];
     const r = this.radius;
     const bodyY = this.kind === 'cup' ? 0.026 : this.kind === 'cupcake' ? 0.03 : this.kind === 'ball' ? r : 0.004;
-    const cx = v1.x;
-    const cy = v1.y + bodyY * this.pop;
-    const cz = v1.z;
+    const onMat = Math.abs(ox - L.mat.center[0]) < MAT_HALF[0] && Math.abs(oz - L.mat.center[2]) < MAT_HALF[1];
+    const surf = onMat ? ON_MAT_Y : ON_CLOTH_Y;
+    this.gx = ox;
+    this.gy = oy + bodyY * this.pop;
+    this.gz = oz;
+    this.gSurf = surf;
+    this.gTop = this.gy + Math.max(r, bodyY) * 0.9;
 
-    // --- contact shadow on the mat / cloth
-    const onMat = Math.abs(cx - L.mat.center[0]) < MAT_HALF[0] && Math.abs(cz - L.mat.center[2]) < MAT_HALF[1];
-    const surf = L.tableY + (onMat ? 0.0063 : 0.0012);
-    const hgt = Math.max(0, v1.y - surf);
+    // --- contact shadow on the mat / cloth (rewritten only when it changes)
+    const hgt = Math.max(0, oy - surf);
     const fade = 1 - smoothstep(0.0, 0.16, hgt);
-    if (visible && fade > 0.01 && v1.y > surf - 0.03) {
+    if (fade > 0.01 && oy > surf - 0.03) {
       const grow = 1 + hgt * 4;
-      this.env.blobs.set(this.blobSlot, cx, surf, cz, this.blobSize[0] * grow * this.pop, this.blobSize[1] * grow * this.pop, 0.62 * fade, this.blobSize[2], this.pivot.rotation.y);
-    } else this.env.blobs.hide(this.blobSlot);
+      const bs = this.blobSize;
+      const sx = bs[0] * grow * this.pop;
+      const sz = bs[1] * grow * this.pop;
+      const op = 0.62 * fade;
+      const B = this.blobApplied;
+      if (ox !== B[0] || oz !== B[1] || surf !== B[2] || sx !== B[3] || sz !== B[4] || op !== B[5] || this.pivotYaw !== B[6]) {
+        B[0] = ox;
+        B[1] = oz;
+        B[2] = surf;
+        B[3] = sx;
+        B[4] = sz;
+        B[5] = op;
+        B[6] = this.pivotYaw;
+        this.env.blobs.set(this.blobSlot, ox, surf, oz, sx, sz, op, bs[2], this.pivotYaw);
+      }
+    } else {
+      this.env.blobs.hide(this.blobSlot);
+      this.blobApplied[0] = Number.NaN;
+    }
 
     // --- glint
     const g = this.glint;
+    if (g === 'none') {
+      const glow = this.env.glow;
+      const S = this.glintSlots;
+      for (let i = 0; i < S.length; i++) glow.hide(S[i]);
+    } else if (g === 'target') this.drawTarget();
+    else this.drawGlint(g === 'gold');
+  }
+
+  /** Gold (lift) / blue (steal) glint around the prop body at (gx, gy, gz). */
+  private drawGlint(gold: boolean): void {
+    const glow = this.env.glow;
     const S = this.glintSlots;
-    if (!visible || g === 'none') {
-      for (const s of S) glow.hide(s);
-      return;
-    }
+    const now = this.now;
+    const r = this.radius;
+    const cx = this.gx;
+    const cy = this.gy;
+    const cz = this.gz;
     const k = Math.max(0.6, r / 0.0125) ** 0.75;
-    if (g === 'gold' || g === 'blue') {
-      const c = g === 'gold' ? GOLD : BLUE;
-      const pulse = g === 'gold' ? 0.7 + 0.3 * Math.sin(now * 5.2) : 0.62 + 0.25 * Math.sin(now * 3.1);
-      glow.set(S[0], cx, cy, cz, 0.06 * k, 0.06 * k, c.r, c.g, c.b, 0.62 * pulse, CELL.halo, MODE.pushed);
+    const c = gold ? GOLD : BLUE;
+    const pulse = gold ? 0.7 + 0.3 * Math.sin(now * 5.2) : 0.62 + 0.25 * Math.sin(now * 3.1);
+    glow.set(S[0], cx, cy, cz, 0.06 * k, 0.06 * k, c.r, c.g, c.b, 0.62 * pulse, CELL.halo, MODE.pushed);
+    if (gold) {
       const tw = now * 0.77 + (this.id.length % 7) * 0.13;
       const ph = tw - Math.floor(tw);
       const flash = Math.exp(-((ph - 0.5) ** 2) * 60);
-      const topY = cy + Math.max(r, bodyY) * 0.9;
-      if (g === 'gold') {
-        const sz = (0.035 + 0.035 * flash) * k;
-        glow.set(S[1], cx + r * 0.5, topY, cz + r * 0.3, sz, sz, 1, 0.92, 0.7, 0.75 + 0.25 * flash, CELL.star4, MODE.pushed, now * 0.6);
-      } else {
-        const sz = 0.05 * k * (0.95 + 0.08 * Math.sin(now * 4));
-        glow.set(S[1], cx, cy, cz, sz, sz, c.r, c.g, c.b, 0.85, CELL.diamond, MODE.pushed, now * 0.9);
-      }
-      for (let i = 0; i < 3; i++) {
-        const a = now * (g === 'gold' ? 1.3 : -1.0) + (i * TAU) / 3;
-        const rad = Math.max(r, 0.012) * 1.7;
-        const tw2 = 0.5 + 0.5 * Math.sin(now * 6.3 + i * 2.1);
-        const sz = (g === 'gold' ? 0.012 : 0.014) * k * (0.5 + tw2);
-        glow.set(S[2 + i], cx + Math.cos(a) * rad, cy + Math.sin(a * 2) * r * 0.4 + r * 0.2, cz + Math.sin(a) * rad, sz, sz, c.r, c.g, c.b, 0.9, g === 'gold' ? CELL.glitter : CELL.star6, MODE.pushed, a);
-      }
+      const sz = (0.035 + 0.035 * flash) * k;
+      glow.set(S[1], cx + r * 0.5, this.gTop, cz + r * 0.3, sz, sz, 1, 0.92, 0.7, 0.75 + 0.25 * flash, CELL.star4, MODE.pushed, now * 0.6);
     } else {
-      // target: flat green ring on the table + an outgoing ripple + soft wash
-      const base = Math.max(r, 0.014) * 3.3;
-      const breathe = 1 + 0.06 * Math.sin(now * 3.4);
-      glow.set(S[0], cx, surf + 0.0012, cz, base * breathe, base * breathe, TARGET.r, TARGET.g, TARGET.b, 0.9, CELL.ring, MODE.flat);
-      const rp = (now * 0.75) % 1;
-      const rs = base * (1 + rp * 0.8);
-      glow.set(S[1], cx, surf + 0.0011, cz, rs, rs, TARGET.r, TARGET.g, TARGET.b, 0.7 * (1 - rp), CELL.ring, MODE.flat);
-      glow.set(S[2], cx, surf + 0.001, cz, base * 1.4, base * 1.4, TARGET.r * 0.6, TARGET.g * 0.6, TARGET.b * 0.6, 0.35, CELL.pool, MODE.flat);
-      glow.hide(S[3]);
-      glow.hide(S[4]);
+      const sz = 0.05 * k * (0.95 + 0.08 * Math.sin(now * 4));
+      glow.set(S[1], cx, cy, cz, sz, sz, c.r, c.g, c.b, 0.85, CELL.diamond, MODE.pushed, now * 0.9);
     }
+    const rad = Math.max(r, 0.012) * 1.7;
+    for (let i = 0; i < 3; i++) {
+      const a = now * (gold ? 1.3 : -1.0) + (i * TAU) / 3;
+      const tw2 = 0.5 + 0.5 * Math.sin(now * 6.3 + i * 2.1);
+      const sz = (gold ? 0.012 : 0.014) * k * (0.5 + tw2);
+      glow.set(S[2 + i], cx + Math.cos(a) * rad, cy + Math.sin(a * 2) * r * 0.4 + r * 0.2, cz + Math.sin(a) * rad, sz, sz, c.r, c.g, c.b, 0.9, gold ? CELL.glitter : CELL.star6, MODE.pushed, a);
+    }
+  }
+
+  /** Load target: flat green ring on the mat/cloth + an outgoing ripple + soft wash, all at/above the surface top. */
+  private drawTarget(): void {
+    const glow = this.env.glow;
+    const S = this.glintSlots;
+    const now = this.now;
+    const cx = this.gx;
+    const cz = this.gz;
+    const surf = this.gSurf;
+    const base = Math.max(this.radius, 0.014) * 3.3;
+    const breathe = 1 + 0.06 * Math.sin(now * 3.4);
+    glow.set(S[0], cx, surf + 0.0012, cz, base * breathe, base * breathe, TARGET.r, TARGET.g, TARGET.b, 0.9, CELL.ring, MODE.flat);
+    const rp = (now * 0.75) % 1;
+    const rs = base * (1 + rp * 0.8);
+    glow.set(S[1], cx, surf + 0.0011, cz, rs, rs, TARGET.r, TARGET.g, TARGET.b, 0.7 * (1 - rp), CELL.ring, MODE.flat);
+    glow.set(S[2], cx, surf + 0.001, cz, base * 1.4, base * 1.4, TARGET.r * 0.6, TARGET.g * 0.6, TARGET.b * 0.6, 0.35, CELL.pool, MODE.flat);
+    glow.hide(S[3]);
+    glow.hide(S[4]);
   }
 
   private isShown(): boolean {
@@ -410,6 +560,14 @@ function mesh(name: string, geo: BufferGeometry, mat: Material): Mesh {
   const m = new Mesh(geo, mat);
   m.name = name;
   return m;
+}
+
+/** Add static meshes to a prop's lifter and stop recomposing their matrices every frame. */
+function addStatic(parent: Object3D, ...objs: Object3D[]): void {
+  for (const o of objs) {
+    parent.add(o);
+    freezeMatrix(o);
+  }
 }
 
 function merge(parts: Part[]): BufferGeometry {
@@ -528,7 +686,7 @@ function watchParts(dialMat: Material, handMat: Material, metal: Material): { bo
   const body = mesh('watch-body', merge(parts), metal);
   const dialGeo = new CircleGeometry(0.0134, 40);
   dialGeo.rotateX(-Math.PI / 2);
-  const dial = mesh('watch-dial', dialGeo, dialMat);
+  const dial = mesh('watch-dial', ensureColor(dialGeo), dialMat);
   dial.position.y = 0.00695;
   const hand = new Group();
   hand.name = 'watch-secondHand';
@@ -538,7 +696,7 @@ function watchParts(dialMat: Material, handMat: Material, metal: Material): { bo
     { geometry: new CylinderGeometry(0.0011, 0.0011, 0.0003, 12), color: 0x2a0a0a },
     { geometry: new CylinderGeometry(0.0013, 0.0013, 0.0002, 12), color: 0xb0161c, position: [0, 0, 0.0028] },
   ]);
-  hand.add(mesh('watch-hand', handGeo, handMat));
+  addStatic(hand, mesh('watch-hand', handGeo, handMat));
   return { body, dial, hand };
 }
 
@@ -621,7 +779,7 @@ function cupcakeParts(felt: Material): { base: Mesh; lid: Group; frosting: Objec
   const lid = new Group();
   lid.name = 'cupcake-lidHinge';
   lid.position.set(0, H + LH - 0.0058, -LW / 2);
-  lid.add(lidMesh);
+  addStatic(lid, lidMesh);
   const frosting = new Object3D();
   frosting.name = 'cupcake-frosting';
   frosting.position.set(0, 0.047, 0);
@@ -630,37 +788,40 @@ function cupcakeParts(felt: Material): { base: Mesh; lid: Group; frosting: Objec
 
 export interface PropsResult {
   props: Record<PropId, PropImpl>;
-  update(dt: number, now: number): void;
+  step(clock: FrameClock): void;
   dispose(): void;
 }
 
 export function buildProps(env: PropEnv, parent: Object3D, mats: PropMaterials): PropsResult {
   const coin = new PropImpl('coin', 'coin', 0.0125, true, false, env, parent, [0.034, 0.034, CELL.blobRound]);
-  coin.content.add(mesh('coin-mesh', coinGeometry(), mats.metal));
+  addStatic(coin.content, mesh('coin-mesh', coinGeometry(), mats.metal));
 
-  const ball = new PropImpl('ball', 'ball', 0.0095, false, false, env, parent, [0.03, 0.03, CELL.blobRound]);
+  // the ball is SHINY (spec §7: the magpie stares at it): polished red lacquer, flagged shiny for the sparkle rule
+  const ball = new PropImpl('ball', 'ball', 0.0095, true, false, env, parent, [0.03, 0.03, CELL.blobRound]);
   const ballGeo = new IcosahedronGeometry(0.0095, 3);
-  const ballMesh = mesh('ball-mesh', mergeParts([{ geometry: ballGeo, color: PAL.ballRed }]), mats.felt);
+  const ballMesh = mesh('ball-mesh', mergeParts([{ geometry: ballGeo, color: 0xffffff }]), mats.lacquer);
   ballGeo.dispose();
   ballMesh.position.y = 0.0095;
-  ball.content.add(ballMesh);
+  addStatic(ball.content, ballMesh);
 
   const cupGeo = cupGeometry();
   const cups = (['cupLeft', 'cupMid', 'cupRight'] as const).map((id) => {
     const p = new PropImpl(id, 'cup', 0.03, true, true, env, parent, [0.078, 0.078, CELL.blobRound]);
-    p.content.add(mesh(`${id}-mesh`, cupGeo, mats.copper));
+    addStatic(p.content, mesh(`${id}-mesh`, cupGeo, mats.copper));
     return p;
   });
 
   const watch = new PropImpl('watch', 'watch', 0.016, true, false, env, parent, [0.04, 0.04, CELL.blobRound]);
   const w = watchParts(mats.dial, mats.hand, mats.metal);
-  watch.content.add(w.body, w.dial, w.hand);
-  watch.secondHand = w.hand;
+  addStatic(watch.content, w.body, w.dial);
+  watch.content.add(w.hand);
+  watch.attachSecondHand(w.hand);
 
   const cupcake = new PropImpl('cupcake', 'cupcake', 0.036, false, true, env, parent, [0.086, 0.086, CELL.blobRect]);
   const cc = cupcakeParts(mats.felt);
-  cupcake.content.add(cc.base, cc.lid, cc.frosting);
-  cupcake.lid = cc.lid;
+  addStatic(cupcake.content, cc.base, cc.frosting);
+  cupcake.content.add(cc.lid);
+  cupcake.attachLid(cc.lid);
   cupcake.frosting = cc.frosting;
   watch.cupcake = cupcake;
 
@@ -676,23 +837,29 @@ export function buildProps(env: PropEnv, parent: Object3D, mats: PropMaterials):
   const list = Object.values(props);
   return {
     props,
-    update(dt, now) {
-      for (const p of list) p.update(dt, now);
+    step(clock) {
+      for (let i = 0; i < list.length; i++) list[i].step(clock);
     },
     dispose() {
+      const seen = new Set<BufferGeometry>();
       for (const p of list) {
         p.root.removeFromParent();
         p.root.traverse((o) => {
           const m = o as Mesh;
-          if (m.isMesh) m.geometry.dispose();
+          if (m.isMesh && !seen.has(m.geometry)) {
+            seen.add(m.geometry);
+            m.geometry.dispose();
+          }
         });
       }
     },
   };
 }
 
-export function makePropMaterials(metal: Material, felt: Material, copper: Material): PropMaterials {
-  const dial = new MeshBasicMaterial({ map: makeDialTexture() });
-  const hand = new MeshBasicMaterial({ vertexColors: true });
-  return { metal, felt, copper, dial, hand };
+/** Prop materials on the café's shared surface program (cafe.ts owns and disposes them). */
+export function makePropMaterials(metal: MeshMatcapMaterial, felt: MeshMatcapMaterial, copper: MeshMatcapMaterial): PropMaterials {
+  const dial = surfaceMaterial({ map: makeDialTexture(), name: 'env-watchDial' });
+  const hand = surfaceMaterial({ name: 'env-watchHand' });
+  const lacquer = surfaceMaterial({ matcap: LACQUER_MATCAP, name: 'env-ballLacquer' });
+  return { metal, felt, copper, lacquer, dial, hand };
 }

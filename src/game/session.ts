@@ -125,34 +125,23 @@ export class SessionController {
     this.wantCalibrate = false;
     this.attention.resetHistory();
     this.gaze.resetFilter();
-    if (!this.runner.started) {
-      let act = this.save.act;
-      let beat = this.save.beat;
-      if (act >= 4 || act < 1) {
-        act = 1;
-        beat = 0;
-      }
-      this.runner.begin(act, beat);
-    } else if (this.freshSession && this.runner.act >= 4) {
-      // back in after leaving from the bow: tonight's show starts again
-      this.runner.restartShow();
-    }
-    this.freshSession = false;
+    // every session starts from the attract view: the show resumes at the autosaved checkpoint (a save at the bow
+    // means tonight's show starts again)
+    if (!this.runner.started) this.runner.begin(this.save.act, this.save.beat, this.save.stars);
     this.applyRunState();
   }
-  /** Set on entering XR; the first calibration of a session may restart a finished show. */
-  private freshSession = false;
 
   setSettings(patch: Partial<Settings>): void {
     this.ctx.settings.value = { ...this.ctx.settings.peek(), ...patch };
   }
 
-  /** Autosave (beat boundaries). */
+  /** Autosave (beat boundaries; a finished act saves the start of the next one). */
   autosave(): void {
     const r = this.runner;
     const def = r.def;
-    this.save.act = r.act || 1;
-    this.save.beat = def ? r.checkpointOf(def) : 0;
+    const actDone = r.phase === 'done' && r.act >= 1 && r.act <= 3;
+    this.save.act = actDone ? r.act + 1 : r.act || 1;
+    this.save.beat = actDone || !def ? 0 : r.checkpointOf(def);
     this.save.settings = { ...this.ctx.settings.peek() };
     this.save.stars = r.stars.slice();
     writeSave(this.save);
@@ -187,7 +176,6 @@ export class SessionController {
   private enterImmersive(): void {
     const { world, audio } = this.ctx;
     this.immersive = true;
-    this.freshSession = true;
     this.wantCalibrate = true;
     this.calibrated = false;
     this.xrFrames = 0;
@@ -224,7 +212,11 @@ export class SessionController {
     this.wantCalibrate = false;
     this.holdIt = false;
     this.paused = false;
-    // the 2D attract view behind the landing page shows an open stage (after Exit, or leaving from a pause)
+    // the calm 2D attract view behind the landing page (after Exit, or leaving from a pause): Act I's kits idling
+    // on an open stage, the coin on its mark, nothing left over from the beat; the show resumes from the autosave
+    if (this.runner.started || !this.runner.attracting) this.runner.attract();
+    this.beatKind = '';
+    this.refreshPlaques();
     try {
       void Promise.resolve(this.ctx.ui.curtain('open')).catch(() => {});
     } catch {
@@ -293,6 +285,12 @@ export class SessionController {
         } catch {
           /* cosmetic */
         }
+      }
+      // the gadgets stand still: so does the music box's tune (it picks up again with the show)
+      try {
+        this.runner.setHeld(freeze);
+      } catch (e) {
+        console.warn('[session] music box hold failed', e);
       }
     }
   }

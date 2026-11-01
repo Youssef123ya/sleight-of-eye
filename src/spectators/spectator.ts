@@ -5,57 +5,116 @@
 //               ├ glyph (Sprite, shared atlas)            <id>-glyph
 //               └ cone  (flat fan on the cloth)           <id>-cone
 // The root never moves: hops move the internal 'root' bone, so the game's seat parenting stays intact.
+//
+// Per-frame work allocates nothing (GC hitches on Quest). Every node below `root` has matrixAutoUpdate = false: the
+// pose lives in plain-number TRS arrays and is composed into the bones' local matrices here (./xform.ts), so neither
+// this code nor the renderer's scene-graph pass goes through three's Euler / Quaternion / Matrix4 helpers, which
+// IWSDK's accessor-bound entity transforms leave megamorphic and allocating. World ↔ puppet conversions use a cached
+// copy of the root's matrixWorld as the renderer left it (≤ 1 frame stale; refreshed at once when the root is
+// re-parented, and exactly at event time) — never updateWorldMatrix / getWorldPosition / worldToLocal per frame.
+// The matrices are authoritative: position / rotation / scale of the internal nodes keep their construction values.
 import {
   Group,
   Matrix4,
   Mesh,
   Object3D,
-  Quaternion,
   Skeleton,
   SkinnedMesh,
   Sprite,
-  Vector3,
   type Bone,
   type BufferGeometry,
   type Material,
   type ShaderMaterial,
   type SpriteMaterial,
+  type Vector3,
 } from '@iwsdk/core';
 import { SPECTATOR_ACCENT } from '../art/palette.js';
 import { CFG } from '../config.js';
 import type { ReactionName, Spectator, SpectatorAnchor, SpectatorKind } from '../contracts.js';
 import { L } from '../layout.js';
 import { makeBoneInverses, makeBones } from './builder.js';
+import type { Traits } from './designs/common.js';
 import { acquireDesign, releaseDesign, type PuppetDesign } from './designs/index.js';
 import { HAT } from './designs/rabbit.js';
 import {
+  CONE_ALARM,
+  CONE_HALF,
+  CONE_OPACITY,
+  CONE_TIME,
   acquireShared,
   coneMaterial,
+  coneState,
   glyphGeometry,
   glyphMaterial,
   releaseShared,
   setGlyphCell,
   type SharedResources,
 } from './materials.js';
-import { DEG, Spring, clamp, damp, easeInOut, easeOutBack, lerp, makeRng, seg, smoothstep, wrapPi } from './math.js';
+import { DEG, Rng, Spring, clamp, copy3, damp, easeInOut, easeOutBack, lerp, seg, set3, settleFields, smoothstep, wrapPi } from './math.js';
 import { PK, addPose, makePose } from './pose.js';
 import { HOP, LOOPING, REACTION_DURATION, STAGGERED, poseReaction, type ReactionCtx } from './reactions.js';
+import {
+  FrameCache,
+  composeAt,
+  identity,
+  invertAffine,
+  mulAffine,
+  quatAxisAngle,
+  quatEulerXYZ,
+  quatEulerYXZ,
+  quatFromUnitVectors,
+  quatMul,
+  quatSlerp,
+  rotateByQuat,
+  xformPoint,
+} from './xform.js';
 
 export type Mood = 'neutral' | 'eyeContact' | 'flustered' | 'suspicious';
 type GlyphState = 'open' | 'closed' | 'hidden';
 
+/** Animated bones in slot order: the TRS arrays, `slots` and `mats` are indexed by these. */
 const BONE_NAMES = [
   'root', 'hat', 'body', 'chest', 'tail', 'head', 'earL', 'earR', 'mouth', 'jaw', 'cheekL', 'cheekR', 'nose',
   'armL', 'armR', 'handL', 'handR', 'eyeL', 'eyeR', 'lidL', 'lidR', 'lowL', 'lowR',
 ] as const;
-type BoneName = (typeof BONE_NAMES)[number];
+const NB = BONE_NAMES.length;
+const ROOT = 0;
+const BODY = 2;
+const CHEST = 3;
+const TAIL = 4;
+const HEAD = 5;
+const EAR_L = 6;
+const EAR_R = 7;
+const MOUTH = 8;
+const JAW = 9;
+const CHEEK_L = 10;
+const CHEEK_R = 11;
+const NOSE = 12;
+const ARM_L = 13;
+const ARM_R = 14;
+const HAND_L = 15;
+const HAND_R = 16;
+const EYE_L = 17;
+const EYE_R = 18;
+const LID_L = 19;
+const LID_R = 20;
+const LOW_L = 21;
+const LOW_R = 22;
 const ANCHORS: SpectatorAnchor[] = ['eyes', 'head', 'ear', 'hand', 'notebook', 'beak', 'hatTop'];
 
 /** Seat feet stand this far above the cloth (the riser). */
 const RISER_DROP = L.riser.topY - L.tableY;
-/** Cone height above the tabletop: over the mat (+3 mm), under the props (+6 mm). */
-export const CONE_LIFT = 0.0045;
-const CONE_SEATED = new Vector3(0, L.tableY + CONE_LIFT - L.riser.topY, L.riser.z + L.riser.depth / 2 - L.seats[0][2]);
+/**
+ * Rig-local height of the flat sight cones: 1.5 mm above the 6 mm velvet mat (over the bare cloth beyond the mat the
+ * extra height is invisible), below every prop's body. Each cone holds this height wherever the game parents its
+ * puppet (it measures against the StageRig above the root), so a lift applied by the game is a no-op.
+ */
+export const CONE_Y = L.mat.top + 0.0015;
+/** The same height above the tabletop. */
+export const CONE_LIFT = CONE_Y - L.tableY;
+/** Cone origin when no StageRig is found above the root: from the riser's front edge (seated) / the hat brim. */
+const CONE_SEATED_Y = CONE_Y - L.riser.topY;
+const CONE_SEATED_Z = L.riser.z + L.riser.depth / 2 - L.seats[0][2];
 const CONE_LEN = 0.34;
 const CONE_ALPHA = 0.17;
 const GLYPH_SIZE = 0.024;
@@ -64,32 +123,36 @@ const BODY_FREE = 70 * DEG;
 const PITCH_MIN = -45 * DEG;
 const PITCH_MAX = 50 * DEG;
 const STEP_TIME = 0.14;
+/** layout.ts names the StageRig root so; the cone height is measured in its frame. */
+const RIG_NAME = 'StageRig';
 
 const IDENTITY = new Matrix4();
-const _v1 = new Vector3();
-const _v2 = new Vector3();
-const _v3 = new Vector3();
-const _v4 = new Vector3();
-const _q1 = new Quaternion();
-const _q2 = new Quaternion();
-const _m1 = new Matrix4();
+// scratch (puppets update one at a time; the getters use their own)
+const _p = new Float64Array(3);
+const _g = new Float64Array(3);
+const _q = new Float64Array(4);
 
-interface Active {
-  name: ReactionName;
-  t: number;
-  dur: number;
-  delay: number;
-  I: number;
-  seed: number;
-  hasTarget: boolean;
-  target: Vector3; // world
-  resolve: () => void;
-  from: Vector3; // hop endpoints (stage space)
-  to: Vector3;
-  fromYaw: number;
-  dirYaw: number;
-  arc: number;
-  prevMood: Mood | null;
+/** One playing reaction (event-time allocation; per-frame code only reads and writes its settled fields). */
+class Active {
+  t = 0;
+  delay = 0;
+  I = 1;
+  seed = 0;
+  hasTarget = false;
+  readonly target = new Float64Array(3); // world x y z
+  readonly from = new Float64Array(3); // hop endpoints (stage space)
+  readonly to = new Float64Array(3);
+  fromYaw = 0;
+  dirYaw = 0;
+  arc = 0;
+  prevMood: Mood | null = null;
+  constructor(
+    readonly name: ReactionName,
+    readonly dur: number,
+    readonly resolve: () => void,
+  ) {
+    settleFields(this);
+  }
 }
 
 const isHop = (n: ReactionName) => n === 'hopToVolunteer' || n === 'hopBack';
@@ -100,6 +163,27 @@ function hashId(s: string): number {
   return h >>> 0;
 }
 
+/** a[i*3 .. i*3+2] = x, y, z (TRS position / scale slots). */
+function put3(a: Float64Array, i: number, x: number, y: number, z: number): void {
+  const o = i * 3;
+  a[o] = x;
+  a[o + 1] = y;
+  a[o + 2] = z;
+}
+
+/** v = (x, y, z) normalised like three's Vector3.normalize. */
+function unit(v: Float64Array, x: number, y: number, z: number): void {
+  const k = 1 / (Math.sqrt(x * x + y * y + z * z) || 1);
+  v[0] = x * k;
+  v[1] = y * k;
+  v[2] = z * k;
+}
+
+function findRig(from: Object3D | null): Object3D | null {
+  for (let o = from; o; o = o.parent) if (o.name === RIG_NAME) return o;
+  return null;
+}
+
 export class PuppetSpectator implements Spectator {
   readonly id: string;
   readonly kind: SpectatorKind;
@@ -107,38 +191,69 @@ export class PuppetSpectator implements Spectator {
   readonly headRadius: number;
 
   private readonly d: PuppetDesign;
+  /** Per-frame code reads these copies, never the design objects (their shapes differ per kind). */
+  private readonly tr: Traits;
+  private readonly lidClose: number;
+  private readonly lidRise: number;
+  private readonly glyphY: number;
   private readonly res: SharedResources;
   private readonly stage = new Group();
   private readonly bones: Bone[];
-  private readonly B: Record<BoneName, Bone>;
+  private readonly slots: Bone[];
+  /** slots[i].matrix.elements (written every step). */
+  private readonly mats: number[][];
   private readonly skeleton: Skeleton;
   private readonly glyph: Sprite;
   private readonly glyphMat: SpriteMaterial;
   private readonly glyphGeo: BufferGeometry;
   private readonly cone: Mesh;
   private readonly coneMat: ShaderMaterial;
+  private readonly coneU: Float32Array;
+  private readonly coneY0: number;
+  private readonly coneZ: number;
   private readonly anchors: Record<SpectatorAnchor, Object3D>;
-  private readonly rng: () => number;
+  private readonly rng: Rng;
   private readonly scale: number;
   private readonly seed: number;
   private readonly tiltDir: number;
 
+  // pose: TRS per slot, the composed local matrices, and the root → chest → head chain in puppet-root space
+  private readonly tp = new Float64Array(NB * 3);
+  private readonly tq = new Float64Array(NB * 4);
+  private readonly ts = new Float64Array(NB * 3);
+  private readonly lm = new Float64Array(NB * 16);
+  private readonly mStage = new Float64Array(16);
+  private readonly mRoot = new Float64Array(16);
+  private readonly mChest = new Float64Array(16);
+  private readonly iChest = new Float64Array(16);
+  private readonly mHead = new Float64Array(16);
+  private readonly iHead = new Float64Array(16);
+  /** The root's matrixWorld as last rendered (+ inverse), and the stage rig's (cone height). */
+  private readonly frame = new FrameCache();
+  private readonly rigFrame = new FrameCache();
+  private rigNode: Object3D | null = null;
+  private parentSeen: Object3D | null = null;
+  private parentChecked = false;
+  /** The eyes anchor in head-bone space. */
+  private readonly eyesAt = new Float64Array(3);
+  private readonly eyesOnHead: boolean;
+
   // rest data
-  private readonly chestRest = new Vector3();
-  private readonly tailRest = new Vector3();
-  private readonly handLRest = new Vector3();
-  private readonly handRRest = new Vector3();
-  private readonly noseRest = new Vector3();
-  private readonly armDirL = new Vector3();
-  private readonly armDirR = new Vector3();
-  private readonly eyeOff = new Vector3();
-  private readonly eyeCL = new Vector3();
-  private readonly eyeCR = new Vector3();
-  private readonly home = new Vector3();
-  private readonly hingeL = new Vector3();
-  private readonly hingeR = new Vector3();
-  private readonly faceL = new Vector3();
-  private readonly faceR = new Vector3();
+  private readonly chestRest = new Float64Array(3);
+  private readonly tailRest = new Float64Array(3);
+  private readonly handLRest = new Float64Array(3);
+  private readonly handRRest = new Float64Array(3);
+  private readonly noseRest = new Float64Array(3);
+  private readonly armDirL = new Float64Array(3);
+  private readonly armDirR = new Float64Array(3);
+  private readonly eyeOff = new Float64Array(3);
+  private readonly eyeCL = new Float64Array(3);
+  private readonly eyeCR = new Float64Array(3);
+  private readonly home = new Float64Array(3);
+  private readonly hingeL = new Float64Array(3);
+  private readonly hingeR = new Float64Array(3);
+  private readonly faceL = new Float64Array(3);
+  private readonly faceR = new Float64Array(3);
 
   // clocks & flags
   private time = 0;
@@ -147,11 +262,11 @@ export class PuppetSpectator implements Spectator {
   private warned = false;
 
   // look
-  private readonly target = new Vector3();
+  private readonly tgt = new Float64Array(3); // lookAt target (world)
   private hasTarget = false;
   private urgency = 0.5;
-  private readonly lookWorld = new Vector3();
-  private readonly idleLocal = new Vector3(0, -0.03, 0.26);
+  private readonly lookR = new Float64Array(3); // this frame's look point (puppet-root space)
+  private readonly idleLocal = Float64Array.of(0, -0.03, 0.26); // root space
   private idleTimer = 0;
   private readonly yawS = new Spring();
   private readonly pitchS = new Spring();
@@ -176,7 +291,7 @@ export class PuppetSpectator implements Spectator {
   private stepSide = 1;
   private stepHop = 0;
   private stepRoll = 0;
-  private readonly base = new Vector3();
+  private readonly base = new Float64Array(3);
   private baseYaw = 0;
   private away = false;
 
@@ -213,10 +328,10 @@ export class PuppetSpectator implements Spectator {
   private readonly P = makePose();
   private readonly RP = makePose();
   private readonly FP = makePose();
-  private readonly aimL = new Vector3(0, -1, 0);
-  private readonly aimR = new Vector3(0, -1, 0);
-  private readonly fadeAimL = new Vector3(0, -1, 0);
-  private readonly fadeAimR = new Vector3(0, -1, 0);
+  private readonly aimL = Float64Array.of(0, -1, 0);
+  private readonly aimR = Float64Array.of(0, -1, 0);
+  private readonly fadeAimL = Float64Array.of(0, -1, 0);
+  private readonly fadeAimR = Float64Array.of(0, -1, 0);
   private readonly ctx: ReactionCtx;
 
   // overlays
@@ -236,44 +351,55 @@ export class PuppetSpectator implements Spectator {
     this.id = opts.id;
     this.kind = kind;
     this.seed = (opts.seed ?? hashId(opts.id)) >>> 0;
-    this.rng = makeRng(this.seed);
+    this.rng = new Rng(this.seed);
     this.d = acquireDesign(kind, this.seed % 3);
+    this.tr = this.d.traits;
+    this.lidClose = this.d.lidClose;
+    this.lidRise = this.d.lidRise;
+    this.glyphY = this.d.glyphY;
     this.res = acquireShared();
     this.scale = opts.scale && opts.scale > 0 ? opts.scale : 1;
     this.headRadius = this.d.headRadius * this.scale;
-    this.tiltDir = this.rng() < 0.5 ? -1 : 1;
+    this.tiltDir = this.rng.next() < 0.5 ? -1 : 1;
     const accent = opts.accent ?? SPECTATOR_ACCENT[kind];
 
     this.root = new Group();
     this.root.name = this.id;
     this.stage.name = `${this.id}-puppet`;
     this.stage.scale.setScalar(this.scale);
+    this.stage.updateMatrix();
+    this.stage.matrixAutoUpdate = false;
     this.root.add(this.stage);
+    identity(this.mStage);
+    this.mStage[0] = this.mStage[5] = this.mStage[10] = this.scale;
 
-    // skeleton + the two skinned meshes
+    // skeleton + the two skinned meshes; every bone's matrix is ours from here on
     this.bones = makeBones(this.d.defs);
     const byName = new Map<string, Bone>();
     for (const b of this.bones) {
       byName.set(b.name, b);
       b.name = `${this.id}.${b.name}`;
       if (!b.parent) this.stage.add(b);
+      b.updateMatrix(); // rest pose (a bone outside BONE_NAMES would keep it)
+      b.matrixAutoUpdate = false;
     }
-    const B = {} as Record<BoneName, Bone>;
-    for (const n of BONE_NAMES) {
+    this.slots = BONE_NAMES.map((n) => {
       const b = byName.get(n);
       if (!b) throw new Error(`[spectators] design ${this.d.key} lacks bone "${n}"`);
-      B[n] = b;
+      return b;
+    });
+    this.mats = this.slots.map((b) => b.matrix.elements);
+    for (let i = 0; i < NB; i++) {
+      const p = this.slots[i].position;
+      put3(this.tp, i, p.x, p.y, p.z);
+      put3(this.ts, i, 1, 1, 1);
+      this.tq[i * 4 + 3] = 1;
     }
-    this.B = B;
     this.skeleton = new Skeleton(this.bones, makeBoneInverses(this.d.defs));
     this.skinned(this.d.felt, this.res.felt, 'felt');
     this.skinned(this.d.gloss, this.res.gloss, 'gloss');
-    B.root.rotation.order = 'YXZ';
-    B.head.rotation.order = 'YXZ';
-    B.eyeL.rotation.order = 'YXZ';
-    B.eyeR.rotation.order = 'YXZ';
 
-    // anchors (named "<id>-<anchor>")
+    // anchors (named "<id>-<anchor>"), fixed offsets on their bones
     const defPos = (n: string) => this.d.defs.find((x) => x.name === n)!.pos;
     const anchors = {} as Record<SpectatorAnchor, Object3D>;
     for (const name of ANCHORS) {
@@ -283,38 +409,44 @@ export class PuppetSpectator implements Spectator {
       const bp = defPos(a.bone);
       const p = name === 'eyes' ? [0, (this.d.eyeL[1] + this.d.eyeR[1]) / 2, (this.d.eyeL[2] + this.d.eyeR[2]) / 2] : a.p;
       o.position.set(p[0] - bp[0], p[1] - bp[1], p[2] - bp[2]);
+      o.updateMatrix();
+      o.matrixAutoUpdate = false;
       byName.get(a.bone)!.add(o);
       anchors[name] = o;
     }
     this.anchors = anchors;
+    const ea = anchors.eyes.position;
+    set3(this.eyesAt, ea.x, ea.y, ea.z);
+    this.eyesOnHead = this.d.anchors.eyes.bone === 'head';
 
     // rest data
-    this.chestRest.copy(B.chest.position);
-    this.tailRest.copy(B.tail.position);
-    this.handLRest.copy(B.handL.position);
-    this.handRRest.copy(B.handR.position);
-    this.noseRest.copy(B.nose.position);
+    const S = this.slots;
+    set3(this.chestRest, S[CHEST].position.x, S[CHEST].position.y, S[CHEST].position.z);
+    set3(this.tailRest, S[TAIL].position.x, S[TAIL].position.y, S[TAIL].position.z);
+    set3(this.handLRest, S[HAND_L].position.x, S[HAND_L].position.y, S[HAND_L].position.z);
+    set3(this.handRRest, S[HAND_R].position.x, S[HAND_R].position.y, S[HAND_R].position.z);
+    set3(this.noseRest, S[NOSE].position.x, S[NOSE].position.y, S[NOSE].position.z);
     const hp = defPos('head');
     const eL = this.d.eyeL;
     const eR = this.d.eyeR;
-    this.eyeCL.set(eL[0] - hp[0], eL[1] - hp[1], eL[2] - hp[2]);
-    this.eyeCR.set(eR[0] - hp[0], eR[1] - hp[1], eR[2] - hp[2]);
-    this.eyeOff.set(0, (eL[1] + eR[1]) / 2 - hp[1], (eL[2] + eR[2]) / 2 - hp[2]);
+    set3(this.eyeCL, eL[0] - hp[0], eL[1] - hp[1], eL[2] - hp[2]);
+    set3(this.eyeCR, eR[0] - hp[0], eR[1] - hp[1], eR[2] - hp[2]);
+    set3(this.eyeOff, 0, (eL[1] + eR[1]) / 2 - hp[1], (eL[2] + eR[2]) / 2 - hp[2]);
     const aL = defPos('armL');
     const hL = defPos('handL');
     const aR = defPos('armR');
     const hR = defPos('handR');
-    this.armDirL.set(hL[0] - aL[0], hL[1] - aL[1], hL[2] - aL[2]).normalize();
-    this.armDirR.set(hR[0] - aR[0], hR[1] - aR[1], hR[2] - aR[2]).normalize();
-    this.home.set(0, this.d.restLift, 0);
+    unit(this.armDirL, hL[0] - aL[0], hL[1] - aL[1], hL[2] - aL[2]);
+    unit(this.armDirR, hR[0] - aR[0], hR[1] - aR[1], hR[2] - aR[2]);
+    set3(this.home, 0, this.d.restLift, 0);
     const ey = this.d.eyeYaw;
-    this.hingeL.set(Math.cos(ey), 0, -Math.sin(ey));
-    this.faceL.set(Math.sin(ey), 0, Math.cos(ey));
-    this.hingeR.set(Math.cos(ey), 0, Math.sin(ey));
-    this.faceR.set(-Math.sin(ey), 0, Math.cos(ey));
-    this.base.copy(this.home);
+    set3(this.hingeL, Math.cos(ey), 0, -Math.sin(ey));
+    set3(this.faceL, Math.sin(ey), 0, Math.cos(ey));
+    set3(this.hingeR, Math.cos(ey), 0, Math.sin(ey));
+    set3(this.faceR, -Math.sin(ey), 0, Math.cos(ey));
+    copy3(this.base, this.home);
 
-    // eye glyph (shared atlas; per-instance tint and UVs)
+    // eye glyph (shared atlas; per-instance tint and UVs); its matrix is written by overlays()
     this.glyphGeo = glyphGeometry();
     this.glyphMat = glyphMaterial(this.res.atlas, accent);
     this.glyph = new Sprite(this.glyphMat);
@@ -322,17 +454,28 @@ export class PuppetSpectator implements Spectator {
     this.glyph.name = `${this.id}-glyph`;
     this.glyph.renderOrder = 3;
     this.glyph.visible = false;
+    this.glyph.matrixAutoUpdate = false;
     this.root.add(this.glyph);
 
-    // sight cone on the cloth, from the riser's front edge (or the hat's brim)
+    // sight cone on the cloth, from the riser's front edge (or the hat's brim); its matrix is written by overlays()
     this.coneMat = coneMaterial(accent);
+    this.coneU = coneState(this.coneMat);
     this.cone = new Mesh(this.res.coneGeo, this.coneMat);
     this.cone.name = `${this.id}-cone`;
     this.cone.renderOrder = 1;
     this.cone.visible = false;
     this.cone.frustumCulled = false;
-    if (this.d.traits.hat) this.cone.position.set(0, CONE_LIFT, HAT.brim * this.scale + 0.004);
-    else this.cone.position.copy(CONE_SEATED);
+    if (this.d.traits.hat) {
+      this.coneY0 = CONE_LIFT; // the hat stands on the cloth
+      this.coneZ = HAT.brim * this.scale + 0.004;
+    } else {
+      this.coneY0 = CONE_SEATED_Y;
+      this.coneZ = CONE_SEATED_Z;
+    }
+    this.cone.position.set(0, this.coneY0, this.coneZ);
+    this.cone.scale.set(CONE_LEN, 1, CONE_LEN);
+    this.cone.updateMatrix();
+    this.cone.matrixAutoUpdate = false;
     this.root.add(this.cone);
 
     this.ctx = {
@@ -345,27 +488,64 @@ export class PuppetSpectator implements Spectator {
       drop: 0,
       toeZ: this.d.toeZ,
       inHat: false,
-      target: new Vector3(0, 0, 1),
+      target: Float64Array.of(0, 0, 1),
       hasTarget: false,
       aimL: this.aimL,
       aimR: this.aimR,
     };
-    this.blinkNext = 0.8 + this.rng() * 3;
-    this.flickTimer = 1.5 + this.rng() * 4;
-    this.fidgetTimer = 4 + this.rng() * 6;
+    settleFields(this.ctx);
+    this.blinkNext = 0.8 + this.rng.next() * 3;
+    this.flickTimer = 1.5 + this.rng.next() * 4;
+    this.fidgetTimer = 4 + this.rng.next() * 6;
     this.pickIdleTarget();
+    settleFields(this);
+    this.frame.sync(this.root.matrixWorld.elements);
+    this.composeRootChest();
+    this.composeHead();
     this.step(1 / 60);
   }
 
   // ------------------------------------------------------------------------------------- contract API
   getEyeWorldPosition(out: Vector3): Vector3 {
-    return this.anchors.eyes.getWorldPosition(out);
+    if (!this.eyesOnHead) {
+      const e = this.anchors.eyes.matrixWorld.elements; // as last rendered
+      out.x = e[12];
+      out.y = e[13];
+      out.z = e[14];
+      return out;
+    }
+    this.frame.sync(this.root.matrixWorld.elements);
+    const a = this.eyesAt;
+    xformPoint(this.mHead, a[0], a[1], a[2], _g);
+    xformPoint(this.frame.m, _g[0], _g[1], _g[2], _g);
+    out.x = _g[0];
+    out.y = _g[1];
+    out.z = _g[2];
+    return out;
   }
 
   getLookDirection(out: Vector3): Vector3 {
-    out.setFromMatrixColumn(this.B.head.matrixWorld, 2);
-    const l = out.length();
-    return l > 1e-8 ? out.multiplyScalar(1 / l) : out.set(0, 0, 1);
+    this.frame.sync(this.root.matrixWorld.elements);
+    const m = this.mHead;
+    const w = this.frame.m;
+    const cx = m[8];
+    const cy = m[9];
+    const cz = m[10];
+    const x = w[0] * cx + w[4] * cy + w[8] * cz;
+    const y = w[1] * cx + w[5] * cy + w[9] * cz;
+    const z = w[2] * cx + w[6] * cy + w[10] * cz;
+    const l = Math.sqrt(x * x + y * y + z * z);
+    if (l > 1e-8) {
+      const k = 1 / l;
+      out.x = x * k;
+      out.y = y * k;
+      out.z = z * k;
+    } else {
+      out.x = 0;
+      out.y = 0;
+      out.z = 1;
+    }
+    return out;
   }
 
   getAnchor(name: SpectatorAnchor): Object3D {
@@ -374,7 +554,10 @@ export class PuppetSpectator implements Spectator {
 
   lookAt(target: Vector3 | null, opts?: { urgency?: number }): void {
     if (target) {
-      this.target.copy(target);
+      const t = this.tgt;
+      t[0] = target.x;
+      t[1] = target.y;
+      t[2] = target.z;
       this.hasTarget = true;
     } else if (this.hasTarget) {
       this.hasTarget = false;
@@ -393,26 +576,13 @@ export class PuppetSpectator implements Spectator {
     const dur =
       LOOPING.has(name) && opts.duration !== undefined && opts.duration > 0 ? Math.max(0.3, opts.duration) : REACTION_DURATION[name];
     return new Promise<void>((resolve) => {
-      const rx: Active = {
-        name,
-        t: 0,
-        dur,
-        delay: STAGGERED.has(name) ? this.rng() * 0.12 : 0,
-        I: clamp(opts.intensity ?? 1, 0, 2),
-        seed: this.rng(),
-        hasTarget: false,
-        target: new Vector3(),
-        resolve,
-        from: new Vector3(),
-        to: new Vector3(),
-        fromYaw: 0,
-        dirYaw: 0,
-        arc: 0,
-        prevMood: null,
-      };
+      const rx = new Active(name, dur, resolve);
+      rx.delay = STAGGERED.has(name) ? this.rng.next() * 0.12 : 0;
+      rx.I = clamp(opts.intensity ?? 1, 0, 2);
+      rx.seed = this.rng.next();
       if (opts.target) {
         rx.hasTarget = true;
-        rx.target.copy(opts.target);
+        set3(rx.target, opts.target.x, opts.target.y, opts.target.z);
       }
       if (isHop(name)) this.prepareHop(rx, opts.target);
       if (name === 'blushScribble') {
@@ -455,7 +625,7 @@ export class PuppetSpectator implements Spectator {
     this.mood = mood;
   }
 
-  /** Not in the contract: match the drawn cone to the active rule (Easy Audience halves it). */
+  /** Match the drawn cone to the active rule (Easy Audience halves it). */
   setSightHalfAngle(deg: number): void {
     this.halfAngle = clamp(deg, 2, 30) * DEG;
   }
@@ -464,6 +634,7 @@ export class PuppetSpectator implements Spectator {
     if (this.disposed) return;
     try {
       const h = Math.min(Math.max(dt, 0), 0.1);
+      this.syncRoot();
       if (!this.frozen && h > 0) this.step(h);
       this.overlays(h);
     } catch (e) {
@@ -494,15 +665,55 @@ export class PuppetSpectator implements Spectator {
     const m = new SkinnedMesh(geo, mat);
     m.name = `${this.id}-${tag}`;
     m.frustumCulled = false;
+    m.matrixAutoUpdate = false; // identity under the stage
     this.stage.add(m);
     m.bind(this.skeleton, IDENTITY);
     return m;
   }
 
+  /** Pick up the root's world matrix; when the game re-parents the root, refresh it now (event-time) and find the rig. */
+  private syncRoot(): void {
+    const parent = this.root.parent;
+    if (!this.parentChecked || parent !== this.parentSeen) {
+      this.parentChecked = true;
+      this.parentSeen = parent;
+      this.root.updateWorldMatrix(true, false);
+      this.rigNode = findRig(parent);
+    }
+    this.frame.sync(this.root.matrixWorld.elements);
+  }
+
+  /** Root bone and chest in puppet-root space (+ the chest's inverse for look targets). */
+  private composeRootChest(): void {
+    const lm = this.lm;
+    composeAt(lm, ROOT * 16, this.tp, this.tq, this.ts, ROOT);
+    mulAffine(this.mStage, lm, ROOT * 16, this.mRoot);
+    composeAt(lm, CHEST * 16, this.tp, this.tq, this.ts, CHEST);
+    mulAffine(this.mRoot, lm, CHEST * 16, this.mChest);
+    invertAffine(this.mChest, this.iChest);
+  }
+
+  private composeHead(): void {
+    composeAt(this.lm, HEAD * 16, this.tp, this.tq, this.ts, HEAD);
+    mulAffine(this.mChest, this.lm, HEAD * 16, this.mHead);
+    invertAffine(this.mHead, this.iHead);
+  }
+
+  /** Compose the remaining slots and hand every local matrix to its bone (the renderer multiplies them down). */
+  private publish(): void {
+    const lm = this.lm;
+    for (let i = 0; i < NB; i++) {
+      const o = i * 16;
+      if (i !== ROOT && i !== CHEST && i !== HEAD) composeAt(lm, o, this.tp, this.tq, this.ts, i);
+      const te = this.mats[i];
+      for (let k = 0; k < 16; k++) te[k] = lm[o + k];
+    }
+    this.stage.matrixWorldNeedsUpdate = true;
+  }
+
   private step(dt: number): void {
     this.time += dt;
     const P = this.P;
-    const B = this.B;
     P.fill(0);
 
     // moods ease in and out
@@ -513,8 +724,8 @@ export class PuppetSpectator implements Spectator {
 
     // reaction layer
     this.RP.fill(0);
-    this.aimL.set(0, -1, 0);
-    this.aimR.set(0, -1, 0);
+    set3(this.aimL, 0, -1, 0);
+    set3(this.aimR, 0, -1, 0);
     const rx = this.rx;
     if (rx) {
       if (rx.delay > 0) rx.delay -= dt;
@@ -539,27 +750,36 @@ export class PuppetSpectator implements Spectator {
       P[PK.armRSwing] += 52 * DEG * nb;
     }
 
-    // ---- mover: placement + reaction offsets + shuffle bounce, leaning about pivotZ
-    const root = B.root;
-    root.position.set(this.base.x + P[PK.x], this.base.y + P[PK.y] + this.stepHop, this.base.z + P[PK.z]);
-    root.rotation.set(P[PK.lean], this.baseYaw + this.bodyYaw + P[PK.yaw], P[PK.roll] + this.stepRoll);
-    const pz = P[PK.pivotZ];
-    if (pz !== 0) {
-      _v1.set(0, 0, pz).applyQuaternion(root.quaternion);
-      const yaw = root.rotation.y;
-      root.position.x += pz * Math.sin(yaw) - _v1.x;
-      root.position.y -= _v1.y;
-      root.position.z += pz * Math.cos(yaw) - _v1.z;
+    // ---- mover: placement + reaction offsets + shuffle bounce, leaning about pivotZ (Euler YXZ)
+    const tp = this.tp;
+    const tq = this.tq;
+    const b = this.base;
+    let px = b[0] + P[PK.x];
+    let py = b[1] + P[PK.y] + this.stepHop;
+    let pz = b[2] + P[PK.z];
+    const yaw = this.baseYaw + this.bodyYaw + P[PK.yaw];
+    quatEulerYXZ(tq, ROOT * 4, P[PK.lean], yaw, P[PK.roll] + this.stepRoll);
+    const piv = P[PK.pivotZ];
+    if (piv !== 0) {
+      rotateByQuat(tq, ROOT * 4, 0, 0, piv, _p);
+      px += piv * Math.sin(yaw) - _p[0];
+      py -= _p[1];
+      pz += piv * Math.cos(yaw) - _p[2];
     }
+    put3(tp, ROOT, px, py, pz);
     const s = clamp(1 + P[PK.squash], 0.55, 1.6);
     const sxz = 1 / Math.sqrt(s);
-    B.body.scale.set(sxz, s, sxz);
-    B.chest.position.set(this.chestRest.x, this.chestRest.y * s, this.chestRest.z);
-    B.tail.position.set(this.tailRest.x * sxz, this.tailRest.y * s, this.tailRest.z * sxz);
+    put3(this.ts, BODY, sxz, s, sxz);
+    const cr = this.chestRest;
+    put3(tp, CHEST, cr[0], cr[1] * s, cr[2]);
+    const tr = this.tailRest;
+    put3(tp, TAIL, tr[0] * sxz, tr[1] * s, tr[2] * sxz);
+    this.composeRootChest();
 
     this.solveLook(dt);
     this.poseFace(dt);
     this.poseLimbs(dt);
+    this.publish();
   }
 
   private fillReaction(rx: Active): void {
@@ -568,13 +788,19 @@ export class PuppetSpectator implements Spectator {
     c.dur = rx.dur;
     c.I = rx.I;
     c.seed = rx.seed;
-    c.inHat = this.d.traits.hat && !this.away;
-    c.drop = this.away || this.d.traits.hat ? 0 : RISER_DROP / this.scale;
+    c.inHat = this.tr.hat && !this.away;
+    c.drop = this.away || this.tr.hat ? 0 : RISER_DROP / this.scale;
     c.hasTarget = rx.hasTarget && !isHop(rx.name);
     if (c.hasTarget) {
-      _v1.copy(rx.target);
-      this.B.chest.worldToLocal(_v1);
-      if (_v1.lengthSq() > 1e-10) c.target.copy(_v1).normalize();
+      // world → puppet root → chest (last frame's chest, as before)
+      const w = rx.target;
+      xformPoint(this.frame.inv, w[0], w[1], w[2], _p);
+      xformPoint(this.iChest, _p[0], _p[1], _p[2], _p);
+      const l2 = _p[0] * _p[0] + _p[1] * _p[1] + _p[2] * _p[2];
+      if (l2 > 1e-10) {
+        const k = 1 / Math.sqrt(l2);
+        set3(c.target, _p[0] * k, _p[1] * k, _p[2] * k);
+      }
     }
     poseReaction(rx.name, c, this.RP);
   }
@@ -587,28 +813,31 @@ export class PuppetSpectator implements Spectator {
     this.bodyYaw = 0;
     this.stepT = -1;
     this.baseYaw = facing;
-    rx.from.copy(this.base);
+    copy3(rx.from, this.base);
     rx.fromYaw = facing;
-    this.stage.updateWorldMatrix(true, false);
+    // event-time: the exact root frame (the game may have re-seated the root this very frame)
+    this.root.updateWorldMatrix(true, false);
+    this.frame.sync(this.root.matrixWorld.elements);
+    const sc = this.scale;
+    const to = rx.to;
     if (rx.name === 'hopToVolunteer') {
       if (target) {
-        rx.to.copy(target);
-        this.stage.worldToLocal(rx.to);
+        xformPoint(this.frame.inv, target.x, target.y, target.z, to);
+        set3(to, to[0] / sc, to[1] / sc, to[2] / sc); // stage space
       } else {
-        rx.to.set(0.06, (L.volunteerSpot[1] - L.riser.topY) / this.scale, 0.27 / this.scale);
+        set3(to, 0.06, (L.volunteerSpot[1] - L.riser.topY) / sc, 0.27 / sc);
       }
     } else {
-      rx.to.copy(this.home);
+      copy3(to, this.home);
     }
     rx.hasTarget = true;
-    rx.target.copy(rx.to);
-    this.stage.localToWorld(rx.target);
-    const dx = rx.to.x - rx.from.x;
-    const dz = rx.to.z - rx.from.z;
-    const dist = Math.hypot(dx, dz);
+    xformPoint(this.frame.m, to[0] * sc, to[1] * sc, to[2] * sc, rx.target);
+    const dx = to[0] - rx.from[0];
+    const dz = to[2] - rx.from[2];
+    const dist = Math.sqrt(dx * dx + dz * dz);
     rx.dirYaw = dist > 0.01 ? Math.atan2(dx, dz) : facing;
-    const lip = this.d.traits.hat ? HAT.height * 0.6 : 0;
-    rx.arc = (0.04 + 0.14 * dist + Math.max(0, rx.to.y - rx.from.y) + lip) * this.d.traits.hop;
+    const lip = this.tr.hat ? HAT.height * 0.6 : 0;
+    rx.arc = (0.04 + 0.14 * dist + Math.max(0, to[1] - rx.from[1]) + lip) * this.tr.hop;
   }
 
   private advanceHop(rx: Active): void {
@@ -619,8 +848,13 @@ export class PuppetSpectator implements Spectator {
     const mid = rx.fromYaw + wrapPi(rx.dirYaw - rx.fromYaw);
     this.baseYaw = lerp(lerp(rx.fromYaw, mid, turnIn), 0, turnOut);
     const p = seg(t, HOP.takeoff * D, HOP.land * D);
-    this.base.lerpVectors(rx.from, rx.to, p);
-    this.base.y += rx.arc * 4 * p * (1 - p);
+    const b = this.base;
+    const f = rx.from;
+    const to = rx.to;
+    b[0] = f[0] + (to[0] - f[0]) * p;
+    b[1] = f[1] + (to[1] - f[1]) * p;
+    b[2] = f[2] + (to[2] - f[2]) * p;
+    b[1] += rx.arc * 4 * p * (1 - p);
   }
 
   private endReaction(): void {
@@ -629,14 +863,18 @@ export class PuppetSpectator implements Spectator {
     this.rx = null;
     const w = rx.delay > 0 ? 0 : this.rxW;
     for (let i = 0; i < PK.COUNT; i++) this.FP[i] = this.RP[i] * w;
-    this.fadeAimL.copy(this.aimL);
-    this.fadeAimR.copy(this.aimR);
+    copy3(this.fadeAimL, this.aimL);
+    copy3(this.fadeAimR, this.aimR);
     this.fadeW = w > 0 ? 1 : 0;
     this.rxW = 0;
     if (isHop(rx.name)) {
-      this.base.copy(rx.to);
+      copy3(this.base, rx.to);
       this.baseYaw = 0;
-      this.away = rx.to.distanceToSquared(this.home) > 0.0004;
+      const h = this.home;
+      const dx = rx.to[0] - h[0];
+      const dy = rx.to[1] - h[1];
+      const dz = rx.to[2] - h[2];
+      this.away = dx * dx + dy * dy + dz * dz > 0.0004;
     }
     if (rx.prevMood !== null && this.mood === 'flustered') this.mood = rx.prevMood;
     rx.resolve();
@@ -644,21 +882,21 @@ export class PuppetSpectator implements Spectator {
 
   private pickIdleTarget(): void {
     const r = this.rng;
-    if (this.d.traits.hat) {
-      if (r() < 0.35) this.idleLocal.set(-0.2, 0.3, 0.45);
-      else this.idleLocal.set(-0.22 + (r() - 0.5) * 0.2, 0.004, 0.02 + r() * 0.12);
-    } else if (r() < 0.28) {
-      this.idleLocal.set((r() - 0.5) * 0.1, 0.26, 0.66);
+    if (this.tr.hat) {
+      if (r.next() < 0.35) set3(this.idleLocal, -0.2, 0.3, 0.45);
+      else set3(this.idleLocal, -0.22 + (r.next() - 0.5) * 0.2, 0.004, 0.02 + r.next() * 0.12);
+    } else if (r.next() < 0.28) {
+      set3(this.idleLocal, (r.next() - 0.5) * 0.1, 0.26, 0.66);
     } else {
-      this.idleLocal.set((r() - 0.5) * 0.24, -0.035, 0.18 + r() * 0.14);
+      set3(this.idleLocal, (r.next() - 0.5) * 0.24, -0.035, 0.18 + r.next() * 0.14);
     }
-    this.idleTimer = 1.2 + r() * 2.6;
+    this.idleTimer = 1.2 + r.next() * 2.6;
   }
 
   private idleLayer(dt: number): void {
     const P = this.P;
     const t = this.time;
-    const tr = this.d.traits;
+    const tr = this.tr;
     const ph = (this.seed % 1000) * 0.0137;
     P[PK.squash] += 0.012 * Math.sin(t * 2.05 + ph) - 0.06 * this.antDip + 0.1 * this.startle;
     P[PK.roll] += 0.022 * Math.sin(t * 0.83 + ph * 2);
@@ -673,8 +911,8 @@ export class PuppetSpectator implements Spectator {
 
     this.flickTimer -= dt;
     if (this.flickTimer <= 0) {
-      this.flickTimer = 2.5 + this.rng() * 5;
-      (this.rng() < 0.5 ? this.earSL : this.earSR).v += 7 + this.rng() * 5;
+      this.flickTimer = 2.5 + this.rng.next() * 5;
+      (this.rng.next() < 0.5 ? this.earSL : this.earSR).v += 7 + this.rng.next() * 5;
     }
     if (!this.hasTarget) {
       this.idleTimer -= dt;
@@ -685,7 +923,7 @@ export class PuppetSpectator implements Spectator {
     this.fidgetTimer -= dt;
     if (this.fidgetTimer <= 0 && this.fidgetT < 0 && !this.rx) {
       this.fidgetT = 0;
-      this.fidgetTimer = 6 + this.rng() * 7;
+      this.fidgetTimer = 6 + this.rng.next() * 7;
     }
     if (this.fidgetT >= 0) {
       this.fidgetT += dt;
@@ -694,7 +932,7 @@ export class PuppetSpectator implements Spectator {
         // taps his monocle with the pencil's end, harrumphs
         const w = clamp(Math.min(f / 0.3, (1.5 - f) / 0.35), 0, 1);
         if (this.RP[PK.aimR] <= 0) {
-          this.aimR.set(0.32, 0.86, 0.38);
+          set3(this.aimR, 0.32, 0.86, 0.38);
           P[PK.aimR] += easeInOut(w);
         }
         P[PK.handR] += Math.sin(f * 30) * 0.4 * w;
@@ -753,43 +991,46 @@ export class PuppetSpectator implements Spectator {
   // ------------------------------------------------------------------------------------------- look
   private solveLook(dt: number): void {
     const P = this.P;
-    const B = this.B;
-    const tr = this.d.traits;
+    const tr = this.tr;
     const rx = this.rx;
 
-    // where to look: reaction target > lookAt target > idle glance
+    // where to look (puppet-root space): reaction target > lookAt target > idle glance
+    const lr = this.lookR;
     if (rx && rx.hasTarget && rx.delay <= 0 && (this.RP[PK.lookTarget] > 0 || (isHop(rx.name) && rx.t < HOP.land * rx.dur))) {
-      this.lookWorld.copy(rx.target);
+      xformPoint(this.frame.inv, rx.target[0], rx.target[1], rx.target[2], lr);
     } else if (this.hasTarget) {
-      this.lookWorld.copy(this.target);
+      xformPoint(this.frame.inv, this.tgt[0], this.tgt[1], this.tgt[2], lr);
     } else {
-      this.lookWorld.copy(this.idleLocal);
-      this.root.localToWorld(this.lookWorld);
+      copy3(lr, this.idleLocal);
     }
 
     // head yaw/pitch in the chest frame, solved from the eye midpoint (two fixed-point passes)
-    B.chest.updateWorldMatrix(true, false);
-    _v1.copy(this.lookWorld);
-    B.chest.worldToLocal(_v1);
-    const hp = B.head.position;
+    xformPoint(this.iChest, lr[0], lr[1], lr[2], _p);
+    const vx = _p[0];
+    const vy = _p[1];
+    const vz = _p[2];
+    const ho = HEAD * 3;
+    const hx = this.tp[ho];
+    const hy = this.tp[ho + 1];
+    const hz = this.tp[ho + 2];
     const eo = this.eyeOff;
-    let dx = _v1.x - hp.x;
-    let dy = _v1.y - hp.y;
-    let dz = _v1.z - hp.z;
+    let dx = vx - hx;
+    let dy = vy - hy;
+    let dz = vz - hz;
     let yaw = Math.atan2(dx, dz);
-    let pitch = Math.atan2(dy, Math.hypot(dx, dz));
+    let pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
     for (let i = 0; i < 2; i++) {
       const cp = Math.cos(-pitch);
       const sp = Math.sin(-pitch);
-      const y1 = eo.y * cp - eo.z * sp;
-      const z1 = eo.y * sp + eo.z * cp;
+      const y1 = eo[1] * cp - eo[2] * sp;
+      const z1 = eo[1] * sp + eo[2] * cp;
       const cy = Math.cos(yaw);
       const sy = Math.sin(yaw);
-      dx = _v1.x - (hp.x + eo.x * cy + z1 * sy);
-      dy = _v1.y - (hp.y + y1);
-      dz = _v1.z - (hp.z - eo.x * sy + z1 * cy);
+      dx = vx - (hx + eo[0] * cy + z1 * sy);
+      dy = vy - (hy + y1);
+      dz = vz - (hz - eo[0] * sy + z1 * cy);
       yaw = Math.atan2(dx, dz);
-      pitch = Math.atan2(dy, Math.hypot(dx, dz));
+      pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
     }
     if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) {
       yaw = 0;
@@ -834,10 +1075,10 @@ export class PuppetSpectator implements Spectator {
       if (this.birdHold <= 0 || Math.abs(wrapPi(desired - this.birdYaw)) > 18 * DEG || Math.abs(desiredPitch - this.birdPitch) > 12 * DEG) {
         this.birdYaw = desired;
         this.birdPitch = desiredPitch;
-        this.birdHold = 0.22 + this.rng() * 0.55;
-        this.birdTilt = (this.rng() - 0.5) * 0.7;
+        this.birdHold = 0.22 + this.rng.next() * 0.55;
+        this.birdTilt = (this.rng.next() - 0.5) * 0.7;
         this.tailS.v += 5;
-        if (Math.abs(delta) > 60 * DEG && this.rng() < 0.5) this.blink();
+        if (Math.abs(delta) > 60 * DEG && this.rng.next() < 0.5) this.blink();
       }
       yawTarget = this.yawS.x + wrapPi(this.birdYaw - this.yawS.x);
       pitchTarget = this.birdPitch;
@@ -854,7 +1095,7 @@ export class PuppetSpectator implements Spectator {
         this.antHold = this.yawS.x;
         this.antOff = -Math.sign(delta) * Math.min(13 * DEG, 0.16 * Math.abs(delta));
         this.antDip = 1;
-        if (this.rng() < 0.65) this.blink();
+        if (this.rng.next() < 0.65) this.blink();
       }
       this.antRef = desired;
     }
@@ -867,20 +1108,23 @@ export class PuppetSpectator implements Spectator {
     this.yawS.step(yawTarget, k, c, dt);
     this.pitchS.step(pitchTarget, k, c, dt);
 
-    // apply: reaction override fades the look out; turn/nod/tilt stay additive
+    // apply (Euler YXZ): reaction override fades the look out; turn/nod/tilt stay additive
     const ov = clamp(P[PK.override], 0, 1);
     const rel = clamp(this.yawS.x - this.bodyYaw, -YAW_LIMIT, YAW_LIMIT);
     this.birdTiltCur = damp(this.birdTiltCur, tr.bird ? this.birdTilt : 0, 16, dt);
     const swing = clamp(-this.yawS.v * 0.018, -0.22, 0.22);
-    B.head.rotation.set(
+    quatEulerYXZ(
+      this.tq,
+      HEAD * 4,
       -this.pitchS.x * (1 - ov) + P[PK.nod],
       rel * (1 - ov) + P[PK.turn],
       (swing + this.birdTiltCur) * (1 - ov) + P[PK.tilt],
     );
+    this.composeHead();
   }
 
   private shuffle(target: number, dt: number): void {
-    const bird = this.d.traits.bird;
+    const bird = this.tr.bird;
     if (this.stepT < 0) {
       const err = target - this.bodyYaw;
       if (Math.abs(err) <= 9 * DEG) {
@@ -912,10 +1156,10 @@ export class PuppetSpectator implements Spectator {
       this.blink();
       if (this.blinkAgain) {
         this.blinkAgain = false;
-        this.blinkNext = 2 + this.rng() * 4;
+        this.blinkNext = 2 + this.rng.next() * 4;
       } else {
-        this.blinkAgain = this.rng() < 0.18;
-        this.blinkNext = this.blinkAgain ? 0.3 : 2 + this.rng() * 4;
+        this.blinkAgain = this.rng.next() < 0.18;
+        this.blinkNext = this.blinkAgain ? 0.3 : 2 + this.rng.next() * 4;
       }
     }
     if (this.blinkT < 0) return 0;
@@ -932,20 +1176,25 @@ export class PuppetSpectator implements Spectator {
   // ------------------------------------------------------------------------------------------- face
   private poseFace(dt: number): void {
     const P = this.P;
-    const B = this.B;
-    const d = this.d;
     const t = this.time;
+    const tq = this.tq;
+    const ts = this.ts;
 
     // eyes lead the head: each pupil aims straight at the target (they converge on near targets)
-    B.head.updateWorldMatrix(false, false);
-    _v2.copy(this.lookWorld);
-    B.head.worldToLocal(_v2);
+    const lr = this.lookR;
+    xformPoint(this.iHead, lr[0], lr[1], lr[2], _p);
     const cl = this.eyeCL;
     const cr = this.eyeCR;
-    let tyL = clamp(Math.atan2(_v2.x - cl.x, _v2.z - cl.z), -0.62, 0.62);
-    let tpL = clamp(Math.atan2(_v2.y - cl.y, Math.hypot(_v2.x - cl.x, _v2.z - cl.z)), -0.5, 0.5);
-    let tyR = clamp(Math.atan2(_v2.x - cr.x, _v2.z - cr.z), -0.62, 0.62);
-    let tpR = clamp(Math.atan2(_v2.y - cr.y, Math.hypot(_v2.x - cr.x, _v2.z - cr.z)), -0.5, 0.5);
+    const lx = _p[0] - cl[0];
+    const ly = _p[1] - cl[1];
+    const lz = _p[2] - cl[2];
+    const rX = _p[0] - cr[0];
+    const rY = _p[1] - cr[1];
+    const rZ = _p[2] - cr[2];
+    let tyL = clamp(Math.atan2(lx, lz), -0.62, 0.62);
+    let tpL = clamp(Math.atan2(ly, Math.sqrt(lx * lx + lz * lz)), -0.5, 0.5);
+    let tyR = clamp(Math.atan2(rX, rZ), -0.62, 0.62);
+    let tpR = clamp(Math.atan2(rY, Math.sqrt(rX * rX + rZ * rZ)), -0.5, 0.5);
     if (!Number.isFinite(tyL + tpL + tyR + tpR)) tyL = tpL = tyR = tpR = 0;
     const away = clamp(P[PK.eyeAway], 0, 1);
     if (away > 0) {
@@ -968,10 +1217,10 @@ export class PuppetSpectator implements Spectator {
     this.eyeYR = damp(this.eyeYR, tyR, er, dt);
     this.eyePR = damp(this.eyePR, tpR, er, dt);
     const ps = clamp(1 + P[PK.pupil] + 0.08 * P[PK.wide], 0.65, 1.45);
-    B.eyeL.rotation.set(-this.eyePL, this.eyeYL, 0);
-    B.eyeR.rotation.set(-this.eyePR, this.eyeYR, 0);
-    B.eyeL.scale.set(ps, ps, 1);
-    B.eyeR.scale.set(ps, ps, 1);
+    quatEulerYXZ(tq, EYE_L * 4, -this.eyePL, this.eyeYL, 0);
+    quatEulerYXZ(tq, EYE_R * 4, -this.eyePR, this.eyeYR, 0);
+    put3(ts, EYE_L, ps, ps, 1);
+    put3(ts, EYE_R, ps, ps, 1);
 
     // lids: blinks, moods, wide eyes; upper lids follow a downward gaze; brows via lid tilt
     const blink = this.blinkAmount(dt);
@@ -983,48 +1232,62 @@ export class PuppetSpectator implements Spectator {
     const cR = clamp(Math.max(blink, base - squint), -0.45, 1);
     const tilt = clamp(P[PK.lidTilt], -0.6, 0.6);
     // hinge about each eye's own corner axis, brow tilt about its facing axis
-    B.lidL.quaternion.setFromAxisAngle(this.hingeL, cL * d.lidClose).multiply(_q2.setFromAxisAngle(this.faceL, tilt));
-    B.lidR.quaternion.setFromAxisAngle(this.hingeR, cR * d.lidClose).multiply(_q2.setFromAxisAngle(this.faceR, -tilt));
+    const hL = this.hingeL;
+    const hR = this.hingeR;
+    const fL = this.faceL;
+    const fR = this.faceR;
+    quatAxisAngle(tq, LID_L * 4, hL[0], hL[1], hL[2], cL * this.lidClose);
+    quatAxisAngle(_q, 0, fL[0], fL[1], fL[2], tilt);
+    quatMul(tq, LID_L * 4, _q[0], _q[1], _q[2], _q[3]);
+    quatAxisAngle(tq, LID_R * 4, hR[0], hR[1], hR[2], cR * this.lidClose);
+    quatAxisAngle(_q, 0, fR[0], fR[1], fR[2], -tilt);
+    quatMul(tq, LID_R * 4, _q[0], _q[1], _q[2], _q[3]);
     const rise = clamp(P[PK.lidLow] + blink * 0.2 - wide * 0.3, -0.4, 1);
-    B.lowL.quaternion.setFromAxisAngle(this.hingeL, -rise * d.lidRise);
-    B.lowR.quaternion.setFromAxisAngle(this.hingeR, -rise * d.lidRise);
+    quatAxisAngle(tq, LOW_L * 4, hL[0], hL[1], hL[2], -rise * this.lidRise);
+    quatAxisAngle(tq, LOW_R * 4, hR[0], hR[1], hR[2], -rise * this.lidRise);
 
     // mouth "O", magpie beak, blush
     const mo = clamp(P[PK.mouth], 0, 1.3);
     const ms = mo < 0.02 ? 0.0001 : 0.3 + 0.7 * mo;
-    B.mouth.scale.set(ms, ms * (0.8 + 0.3 * mo), ms);
+    put3(ts, MOUTH, ms, ms * (0.8 + 0.3 * mo), ms);
     const bk = clamp(Math.max(P[PK.beak], 0), 0, 1.2);
-    B.jaw.rotation.set(bk * 0.5, 0, 0);
+    quatEulerXYZ(tq, JAW * 4, bk * 0.5, 0, 0);
     const bl = clamp(P[PK.blush], 0, 1.2);
     const bs = bl < 0.02 ? 0.0001 : easeOutBack(Math.min(1, bl * 1.2), 2.2) * (0.85 + 0.15 * bl);
-    B.cheekL.scale.setScalar(bs);
-    B.cheekR.scale.setScalar(bs);
+    put3(ts, CHEEK_L, bs, bs, bs);
+    put3(ts, CHEEK_R, bs, bs, bs);
 
     // nose twitch (the rabbit's never stops for long)
-    B.nose.position.copy(this.noseRest);
+    const nr = this.noseRest;
     if (this.kind === 'rabbit') {
       const tw = Math.max(0, Math.sin(t * 0.9 + this.seed)) ** 6;
-      B.nose.position.y += Math.sin(t * 46) * 0.00045 * tw;
-      B.nose.scale.setScalar(1 + Math.sin(t * 46) * 0.06 * tw);
+      put3(this.tp, NOSE, nr[0], nr[1] + Math.sin(t * 46) * 0.00045 * tw, nr[2]);
+      const ns = 1 + Math.sin(t * 46) * 0.06 * tw;
+      put3(ts, NOSE, ns, ns, ns);
+    } else {
+      put3(this.tp, NOSE, nr[0], nr[1], nr[2]);
     }
   }
 
   // ------------------------------------------------------------------------------------------ limbs
   private poseLimbs(dt: number): void {
     const P = this.P;
-    const B = this.B;
-    const tr = this.d.traits;
+    const tr = this.tr;
     const t = this.time;
+    const tp = this.tp;
+    const tq = this.tq;
 
-    // head vertical acceleration drives floppy ears and tail
-    _v3.setFromMatrixPosition(B.head.matrixWorld);
+    // head vertical acceleration (world) drives floppy ears and tail
+    const m = this.mHead;
+    const w = this.frame.m;
+    const headY = w[1] * m[12] + w[5] * m[13] + w[9] * m[14] + w[13];
     let jig = 0;
     if (this.hasPrevHead) {
-      const vy = (_v3.y - this.prevHeadY) / dt;
+      const vy = (headY - this.prevHeadY) / dt;
       jig = clamp((vy - this.prevVelY) / dt, -40, 40);
       this.prevVelY = vy;
     } else this.hasPrevHead = true;
-    this.prevHeadY = _v3.y;
+    this.prevHeadY = headY;
 
     const earT = clamp(P[PK.ears], -0.6, 1.4) - 0.35 * clamp(P[PK.earPerk], 0, 1.5);
     this.earSL.v += jig * 9 * tr.earFlop * dt;
@@ -1035,43 +1298,60 @@ export class PuppetSpectator implements Spectator {
     const eR = this.earSR.step(earT + P[PK.earR], kE, cE, dt);
     const sway = clamp(this.yawS.v * 0.03, -0.35, 0.35) * (tr.earFlop > 1.5 ? 1.6 : 1);
     const perk = clamp(P[PK.earPerk], 0, 1.5);
-    B.earL.rotation.set(-eL * 0.55 + perk * 0.22, 0, -eL * 0.85 + sway);
-    B.earR.rotation.set(-eR * 0.55 + perk * 0.22, 0, eR * 0.85 + sway);
+    quatEulerXYZ(tq, EAR_L * 4, -eL * 0.55 + perk * 0.22, 0, -eL * 0.85 + sway);
+    quatEulerXYZ(tq, EAR_R * 4, -eR * 0.55 + perk * 0.22, 0, eR * 0.85 + sway);
 
     this.tailS.v += jig * 6 * tr.tailFlop * dt;
     const tl = this.tailS.step(clamp(P[PK.tailLift], -1, 1.5), 120, 6, dt);
-    B.tail.rotation.set(-tl * 0.5, clamp(P[PK.tailWag], -1.6, 1.6) * 0.7, 0);
+    quatEulerXYZ(tq, TAIL * 4, -tl * 0.5, clamp(P[PK.tailWag], -1.6, 1.6) * 0.7, 0);
 
     // arms: euler offsets, blended toward an aim direction when a reaction points somewhere
     const aimLv = this.RP[PK.aimL] > 0 || this.fadeW <= 0 ? this.aimL : this.fadeAimL;
     const aimRv = this.RP[PK.aimR] > 0 || this.fadeW <= 0 ? this.aimR : this.fadeAimR;
-    this.poseArm(B.armL, 1, P[PK.armLSwing], P[PK.armLRaise], P[PK.armLTwist], clamp(P[PK.aimL], 0, 1), aimLv, this.armDirL);
-    this.poseArm(B.armR, -1, P[PK.armRSwing], P[PK.armRRaise], P[PK.armRTwist], clamp(P[PK.aimR], 0, 1), aimRv, this.armDirR);
+    this.poseArm(ARM_L, 1, P[PK.armLSwing], P[PK.armLRaise], P[PK.armLTwist], clamp(P[PK.aimL], 0, 1), aimLv, this.armDirL);
+    this.poseArm(ARM_R, -1, P[PK.armRSwing], P[PK.armRRaise], P[PK.armRTwist], clamp(P[PK.aimR], 0, 1), aimRv, this.armDirR);
 
     const reach = 1 + 0.34 * clamp(P[PK.reach], 0, 1);
-    B.handL.position.copy(this.handLRest).multiplyScalar(reach);
-    B.handR.position.copy(this.handRRest).multiplyScalar(reach);
-    B.handL.rotation.set(P[PK.handL] * 0.6, 0, 0);
-    B.handR.rotation.set(P[PK.handR] * 0.6, 0, 0);
+    const hl = this.handLRest;
+    const hr = this.handRRest;
+    put3(tp, HAND_L, hl[0] * reach, hl[1] * reach, hl[2] * reach);
+    let pencilX = hr[0] * reach;
+    let pencilY = hr[1] * reach;
+    let pencilRoll = 0;
     if (this.kind === 'badger') {
+      // Brock's pencil hand scribbles
       const sc = clamp(P[PK.scribble], 0, 1);
       if (sc > 0) {
-        const w = t * 27;
-        B.handR.position.x += (0.0035 + Math.cos(w) * 0.0024) * sc;
-        B.handR.position.y += Math.sin(w * 1.31) * 0.0017 * sc;
-        B.handR.rotation.z += Math.sin(w) * 0.25 * sc;
+        const a = t * 27;
+        pencilX += (0.0035 + Math.cos(a) * 0.0024) * sc;
+        pencilY += Math.sin(a * 1.31) * 0.0017 * sc;
+        pencilRoll = Math.sin(a) * 0.25 * sc;
       }
     }
+    put3(tp, HAND_R, pencilX, pencilY, hr[2] * reach);
+    quatEulerXYZ(tq, HAND_L * 4, P[PK.handL] * 0.6, 0, 0);
+    quatEulerXYZ(tq, HAND_R * 4, P[PK.handR] * 0.6, 0, pencilRoll);
   }
 
-  private poseArm(bone: Bone, side: number, swing: number, raise: number, twist: number, aimW: number, aim: Vector3, rest: Vector3): void {
-    bone.rotation.set(-swing, twist * side, raise * side);
+  private poseArm(slot: number, side: number, swing: number, raise: number, twist: number, aimW: number, aim: Float64Array, rest: Float64Array): void {
+    const tq = this.tq;
+    const o = slot * 4;
+    quatEulerXYZ(tq, o, -swing, twist * side, raise * side);
     if (aimW > 0.001) {
-      _v4.copy(aim);
-      if (_v4.lengthSq() < 1e-8) _v4.set(0, -1, 0);
-      _v4.normalize();
-      _q1.setFromUnitVectors(rest, _v4);
-      bone.quaternion.slerp(_q1, aimW);
+      let ax = aim[0];
+      let ay = aim[1];
+      let az = aim[2];
+      if (ax * ax + ay * ay + az * az < 1e-8) {
+        ax = 0;
+        ay = -1;
+        az = 0;
+      }
+      const k = 1 / (Math.sqrt(ax * ax + ay * ay + az * az) || 1);
+      ax *= k;
+      ay *= k;
+      az *= k;
+      quatFromUnitVectors(_q, 0, rest[0], rest[1], rest[2], ax, ay, az);
+      quatSlerp(tq, o, _q[0], _q[1], _q[2], _q[3], aimW);
     }
   }
 
@@ -1091,39 +1371,103 @@ export class PuppetSpectator implements Spectator {
       }
       if (k >= 1) this.glyphAnim = -1;
     }
-    this.glyph.visible = pop > 0.02;
-    if (this.glyph.visible) {
-      _v3.setFromMatrixPosition(this.B.head.matrixWorld);
-      _v3.y += this.d.glyphY * this.scale + 0.0025 * Math.sin(this.time * 2.4 + this.seed);
-      this.root.updateWorldMatrix(true, false);
-      this.root.worldToLocal(_v3);
-      this.glyph.position.copy(_v3);
-      this.glyph.scale.setScalar(GLYPH_SIZE * pop);
+    const glyphOn = pop > 0.02;
+    this.glyph.visible = glyphOn;
+    if (glyphOn) {
+      // above the head along world up (expressed in root space), bobbing gently
+      const m = this.mHead;
+      const fi = this.frame.inv;
+      const up = this.glyphY * this.scale + 0.0025 * Math.sin(this.time * 2.4 + this.seed);
+      const s = GLYPH_SIZE * pop;
+      const te = this.glyph.matrix.elements;
+      te[0] = s;
+      te[1] = 0;
+      te[2] = 0;
+      te[3] = 0;
+      te[4] = 0;
+      te[5] = s;
+      te[6] = 0;
+      te[7] = 0;
+      te[8] = 0;
+      te[9] = 0;
+      te[10] = s;
+      te[11] = 0;
+      te[12] = m[12] + fi[4] * up;
+      te[13] = m[13] + fi[5] * up;
+      te[14] = m[14] + fi[6] * up;
+      te[15] = 1;
+      this.glyph.matrixWorldNeedsUpdate = true;
     }
 
     // sight cone: follows the head's yaw, fades when facing away from the mat, pulses red on alarm
-    const u = this.coneMat.uniforms;
     if (dt > 0) {
       this.coneVis = damp(this.coneVis, this.coneOn && !this.away ? 1 : 0, 8, dt);
       this.alarm = damp(this.alarm, this.alarmOn ? 1 : 0, 10, dt);
     }
-    u.uTime.value = this.time;
     if (this.coneVis < 0.01) {
       this.cone.visible = false;
       return;
     }
-    _v1.setFromMatrixColumn(this.B.head.matrixWorld, 2);
-    _m1.copy(this.root.matrixWorld).invert();
-    _v1.transformDirection(_m1);
-    const h = Math.hypot(_v1.x, _v1.z);
-    const fwd = h > 1e-4 ? _v1.z / h : 0;
-    this.cone.rotation.set(0, Math.atan2(_v1.x, _v1.z), 0);
-    this.cone.scale.set(CONE_LEN, 1, CONE_LEN);
-    const facing = smoothstep(-0.05, 0.45, fwd) * (1 - smoothstep(0.2, 0.6, _v1.y));
+    const m = this.mHead; // head forward = its +Z column, already in root space
+    let fx = m[8];
+    let fy = m[9];
+    let fz = m[10];
+    const fk = 1 / (Math.sqrt(fx * fx + fy * fy + fz * fz) || 1);
+    fx *= fk;
+    fy *= fk;
+    fz *= fk;
+    const h = Math.sqrt(fx * fx + fz * fz);
+    const fwd = h > 1e-4 ? fz / h : 0;
+    const facing = smoothstep(-0.05, 0.45, fwd) * (1 - smoothstep(0.2, 0.6, fy));
     const a = CONE_ALPHA * this.coneVis * Math.max(facing, this.alarm);
-    u.uOpacity.value = a;
-    u.uAlarm.value = this.alarm;
-    u.uHalf.value = this.halfAngle;
-    this.cone.visible = a > 0.003;
+    const u = this.coneU;
+    u[CONE_OPACITY] = a;
+    u[CONE_ALARM] = this.alarm;
+    u[CONE_TIME] = this.time;
+    u[CONE_HALF] = this.halfAngle;
+    const on = a > 0.003;
+    this.cone.visible = on;
+    if (!on) return;
+    // T(0, y, z) · Ry(yaw) · S(len, 1, len), at the rig-local cone height
+    const yaw = Math.atan2(fx, fz);
+    const c = Math.cos(yaw) * CONE_LEN;
+    const s = Math.sin(yaw) * CONE_LEN;
+    const te = this.cone.matrix.elements;
+    te[0] = c;
+    te[1] = 0;
+    te[2] = -s;
+    te[3] = 0;
+    te[4] = 0;
+    te[5] = 1;
+    te[6] = 0;
+    te[7] = 0;
+    te[8] = s;
+    te[9] = 0;
+    te[10] = c;
+    te[11] = 0;
+    te[12] = 0;
+    te[13] = this.coneHeight();
+    te[14] = this.coneZ;
+    te[15] = 1;
+    this.cone.matrixWorldNeedsUpdate = true;
+  }
+
+  /**
+   * Root-space y that puts the cone origin (0, y, coneZ) at rig-local height CONE_Y, wherever the root is parented
+   * (seat on the riser, the rabbit's hat on the cloth, a hop): solves rigLocalY(rootWorld · p) = CONE_Y. Falls back
+   * to the layout-derived offset when no StageRig is above the root.
+   */
+  private coneHeight(): number {
+    const rig = this.rigNode;
+    if (rig) {
+      this.rigFrame.sync(rig.matrixWorld.elements);
+      const ri = this.rigFrame.inv;
+      const w = this.frame.m;
+      const z = this.coneZ;
+      const A = ri[1] * w[4] + ri[5] * w[5] + ri[9] * w[6];
+      const B = ri[1] * (w[8] * z + w[12]) + ri[5] * (w[9] * z + w[13]) + ri[9] * (w[10] * z + w[14]) + ri[13];
+      if (A > 0.3) return (CONE_Y - B) / A;
+    }
+    return this.coneY0;
   }
 }

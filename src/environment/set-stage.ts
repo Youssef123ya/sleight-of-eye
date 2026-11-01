@@ -1,24 +1,24 @@
 // The performance area: draped gingham cloth, velvet close-up mat, audience riser, gadget shelf, pendant lamp.
 import {
-  AdditiveBlending,
   BoxGeometry,
   BufferGeometry,
   CylinderGeometry,
   ExtrudeGeometry,
   Float32BufferAttribute,
-  FrontSide,
   Mesh,
   PlaneGeometry,
-  ShaderMaterial,
   SphereGeometry,
   TorusGeometry,
+  Vector4,
+  type ShaderMaterial,
 } from '@iwsdk/core';
 import { PAL } from '../art/palette.js';
 import { L } from '../layout.js';
 import { CELL } from './textures.js';
 import { MODE } from './glow.js';
+import { AdditiveBlending, KIND, envShaderMaterial } from './shader.js';
 import { CEIL, FLOOR, T, put, type Buckets, type StaticBlob } from './set-common.js';
-import { lathe, roundedBox, roundedRectShape, starPlate, TAU } from './util.js';
+import { ensureColor, lathe, roundedBox, roundedRectShape, starPlate, TAU } from './util.js';
 
 // ------------------------------------------------------------------------------------------------- cloth
 
@@ -166,11 +166,12 @@ export function clothGeometry(): BufferGeometry {
 
 // --------------------------------------------------------------------------------------------------- mat
 
+/** The velvet mat slab: from the cloth (L.tableY) up to L.mat.top, bevelled, UVs across the top; white vertex colours. */
 export function matGeometry(): BufferGeometry {
   const [mw, md] = L.mat.size;
   const bevel = 0.0016;
   const g = new ExtrudeGeometry(roundedRectShape(mw - 2 * bevel, md - 2 * bevel, 0.012), {
-    depth: 0.006 - 2 * bevel,
+    depth: L.mat.top - T - 2 * bevel,
     bevelEnabled: true,
     bevelThickness: bevel,
     bevelSize: bevel,
@@ -188,7 +189,7 @@ export function matGeometry(): BufferGeometry {
     uv[i * 2 + 1] = Math.min(1, Math.max(0, (-lz + md / 2) / md));
   }
   g.setAttribute('uv', new Float32BufferAttribute(uv, 2));
-  return g;
+  return ensureColor(g);
 }
 
 // ------------------------------------------------------------------------------------- furniture + lamp
@@ -330,41 +331,21 @@ export function lampEmissiveColor(px: number, py: number, pz: number, out: { r: 
   return true;
 }
 
-/** Faint volumetric cone under the lamp (front faces only, additive, fades toward the cloth). */
+/**
+ * Faint volumetric cone under the lamp (front faces only, additive, fades toward the cloth) on the shared program:
+ * uTint = rgb colour, a = lamp level.
+ */
 export function makeBeam(): Mesh<BufferGeometry, ShaderMaterial> {
   const [lx, ly, lz] = L.lamp;
   const top = ly - 0.03;
   const bottom = T + 0.004;
   const h = top - bottom;
   const geo = new CylinderGeometry(0.125, 0.44, h, 48, 6, true);
-  const mat = new ShaderMaterial({
+  const mat = envShaderMaterial({
     name: 'env-beam',
-    uniforms: { uLevel: { value: 1 }, uColor: { value: [1.0, 0.68, 0.36] } },
-    vertexShader: /* glsl */ `
-      varying float vFacing;
-      varying float vH;
-      void main() {
-        vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        vec3 n = normalize(normalMatrix * normal);
-        vFacing = abs(dot(n, normalize(-mv.xyz)));
-        vH = position.y / ${h.toFixed(4)} + 0.5;
-        gl_Position = projectionMatrix * mv;
-      }`,
-    fragmentShader: /* glsl */ `
-      uniform float uLevel;
-      uniform vec3 uColor;
-      varying float vFacing;
-      varying float vH;
-      void main() {
-        float a = pow(vFacing, 1.6) * smoothstep(0.0, 0.4, vH) * (0.3 + 0.7 * vH) * (1.0 - smoothstep(0.86, 1.0, vH));
-        gl_FragColor = vec4(uColor, a * 0.32 * uLevel);
-        #include <colorspace_fragment>
-      }`,
-    transparent: true,
-    depthWrite: false,
+    kind: KIND.beam,
+    uniforms: { uTint: { value: new Vector4(1.0, 0.68, 0.36, 1) }, uBeamH: { value: h } },
     blending: AdditiveBlending,
-    side: FrontSide,
-    toneMapped: false,
   });
   const m = new Mesh(geo, mat);
   m.name = 'env-lampBeam';
@@ -373,10 +354,10 @@ export function makeBeam(): Mesh<BufferGeometry, ShaderMaterial> {
   return m;
 }
 
-/** Lamp halo + warm pool on the cloth (GlowBatch flat decal) descriptors. */
+/** Lamp halo + warm pool (GlowBatch flat decal, just above the mat top so it also lies on the velvet) descriptors. */
 export const LAMP_GLOWS = {
   halo: { x: L.lamp[0], y: L.lamp[1] - 0.01, z: L.lamp[2], size: 0.26, r: 1.0, g: 0.58, b: 0.26, a: 0.42, cell: CELL.halo, mode: MODE.billboard },
   core: { x: L.lamp[0], y: L.lamp[1] - 0.004, z: L.lamp[2], size: 0.075, r: 1.0, g: 0.86, b: 0.62, a: 0.6, cell: CELL.halo, mode: MODE.billboard },
-  pool: { x: L.lamp[0], y: T + 0.0068, z: L.lamp[2] + 0.04, size: 0.86, r: 1.0, g: 0.58, b: 0.24, a: 0.3, cell: CELL.pool, mode: MODE.flat },
+  pool: { x: L.lamp[0], y: L.mat.top + 0.0008, z: L.lamp[2] + 0.04, size: 0.86, r: 1.0, g: 0.58, b: 0.24, a: 0.3, cell: CELL.pool, mode: MODE.flat },
 };
 

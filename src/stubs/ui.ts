@@ -288,10 +288,17 @@ class StubUI implements UI {
   }
 
   private curtainToken = 0;
+  private curtainState: 'open' | 'closed' = 'open';
+
+  /** Extra (not in the contract, as the real UI): the curtain's target state. */
+  get curtainClosed(): boolean {
+    return this.curtainState === 'closed';
+  }
 
   curtain(state: 'open' | 'closed'): Promise<void> {
     const from = this.curtainY;
     const to = state === 'closed' ? L.tableY + 0.5 : 1.25;
+    this.curtainState = state;
     const token = ++this.curtainToken; // a newer call supersedes this one
     this.curtainMesh.visible = true;
     return this.tweens.run(0.9, (u) => {
@@ -430,6 +437,15 @@ class StubUI implements UI {
   banner(text: string | null): void {
     if (text) this.bannerText.draw(text, 'banner');
     this.bannerText.sprite.visible = !!text;
+  }
+
+  /** Extra (not in the contract): drop every caption at once (the calm attract view after Exit). */
+  clearCaptions(): void {
+    for (const c of this.captions) {
+      c.label.sprite.visible = false;
+      c.at = null;
+      c.until = 0;
+    }
   }
 
   update(dt: number): void {

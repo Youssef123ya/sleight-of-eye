@@ -13,13 +13,13 @@ export const CFG = {
   sightHalfAngle: 22, // a spectator "sees" a point inside this cone around its head forward
   sightHalfAngleEasy: 11,
   flusterDuration: 6.0, // Brock scribbles in his notebook
-  bangLookDuration: 4.0, // every free head looks at the firework burst
+  bangLookDuration: 5.0, // every free head looks at the firework burst (palm + load must fit inside)
   headTurnStiffness: 140, // spring for head turns (anticipation/overshoot live in the spectator module)
   headTurnDamping: 14,
 
   // Gadgets
-  musicBoxDuration: 5.0,
-  candleDuration: 5.0,
+  musicBoxDuration: 6.0,
+  candleDuration: 7.5, // Act II palms AND loads inside this window: generous for first-time players
   fuseDuration: 2.5,
 
   // Hands

@@ -1,29 +1,23 @@
 // Assemble the static café: merge every bucket into ONE mesh per material, bake light into vertex colours,
 // add the cloth, mat, night window and lamp beam, and register static glows + contact-shadow blobs.
 // Draw calls: room, wood, brass, glossy, emissive, décor, cloth, mat, night pane, beam = 10.
-import {
-  Color,
-  Group,
-  Mesh,
-  MeshBasicMaterial,
-  MeshMatcapMaterial,
-  type BufferGeometry,
-  type Material,
-  type ShaderMaterial,
-  type Texture,
-} from '@iwsdk/core';
+// Shader programs: the opaque meshes share the surface program (surface.ts), the emissive bulbs / night pane / beam
+// the café's custom program (shader.ts) — 2 programs for the whole set.
+import { Color, Group, Mesh, Vector4, type BufferGeometry, type Material, type ShaderMaterial } from '@iwsdk/core';
 import { mergeParts, type Part } from '../art/geometry.js';
-import { MATCAPS, makeMatcap, matcapMaterial } from '../art/matcap.js';
+import { MATCAPS } from '../art/matcap.js';
 import type { BlobBatch, GlowBatch } from './glow.js';
 import { lightAt } from './light.js';
 import { CEIL, EXTRA_LIGHTS, FLOOR, newBuckets, type StaticGlow } from './set-common.js';
 import { buildRoom } from './set-room.js';
 import { LAMP_GLOWS, buildStage, clothGeometry, lampEmissiveColor, makeBeam, matGeometry } from './set-stage.js';
+import { KIND, envShaderMaterial } from './shader.js';
+import { surfaceMaterial } from './surface.js';
 import { makeClothTexture, makeDecorTexture, makeMatTexture, makeWallpaperTexture } from './textures.js';
-import { bakeColors, rng, smoothstep } from './util.js';
+import { bakeColors, freezeMatrix, rng, smoothstep } from './util.js';
 
 export interface LitMaterial {
-  mat: MeshBasicMaterial | MeshMatcapMaterial;
+  mat: { color: Color };
   /** Colour multiplier at lamp level 0 (1 at full). */
   floor: number;
 }
@@ -32,6 +26,12 @@ export interface SetResult {
   group: Group;
   lit: LitMaterial[];
   beam: Mesh<BufferGeometry, ShaderMaterial>;
+  /** Beam colour (rgb) and lamp level (w). */
+  beamTint: Vector4;
+  /** Emissive bulbs tint (rgb = lamp level). */
+  emissiveTint: Vector4;
+  /** Night sky clock (x = seconds). */
+  nightClock: Vector4;
   night: Mesh<BufferGeometry, ShaderMaterial>;
   glows: StaticGlow[];
   lampGlows: { halo: StaticGlow; core: StaticGlow; pool: StaticGlow };
@@ -68,7 +68,7 @@ export function buildSet(glow: GlowBatch, blobs: BlobBatch, anisotropy: number):
     c.multiply(tmp).multiplyScalar(ao);
   });
   const wallpaper = makeWallpaperTexture(anisotropy);
-  const roomMat = new MeshBasicMaterial({ map: wallpaper, vertexColors: true });
+  const roomMat = surfaceMaterial({ map: wallpaper, name: 'env-room' });
   add('env-room', roomGeo, roomMat);
   disposables.push(wallpaper);
 
@@ -77,7 +77,7 @@ export function buildSet(glow: GlowBatch, blobs: BlobBatch, anisotropy: number):
     lightAt(x, y, z, nx, ny, nz, tmp, { tableShadow: true, extra: EXTRA_LIGHTS });
     c.multiply(tmp);
   });
-  const woodMat = matcapMaterial('wood');
+  const woodMat = surfaceMaterial({ matcap: 'wood', name: 'env-wood' });
   add('env-wood', woodGeo, woodMat);
 
   const metalBake = (x: number, y: number, z: number, nx: number, ny: number, nz: number, c: Color) => {
@@ -86,17 +86,18 @@ export function buildSet(glow: GlowBatch, blobs: BlobBatch, anisotropy: number):
     c.g *= 0.22 + 0.78 * Math.min(1.2, tmp.g);
     c.b *= 0.22 + 0.78 * Math.min(1.2, tmp.b);
   };
-  const brassMat = matcapMaterial('brass');
+  const brassMat = surfaceMaterial({ matcap: 'brass', name: 'env-brass' });
   add('env-brass', bakeColors(merged(b.brass, false), metalBake), brassMat);
-  const glossyMat = matcapMaterial('glossy');
+  const glossyMat = surfaceMaterial({ matcap: 'glossy', name: 'env-glossy' });
   add('env-glossy', bakeColors(merged(b.glossy, false), metalBake), glossyMat);
 
-  // --- emissive bits (bulbs, lamp interior): unlit, not tone-mapped
+  // --- emissive bits (bulbs, lamp interior): unlit, not tone-mapped (shared custom program, emissive path)
   const lampCol = { r: 0, g: 0, b: 0 };
   const emiGeo = bakeColors(merged(b.emissive, false), (x, y, z, _nx, _ny, _nz, c) => {
     if (lampEmissiveColor(x, y, z, lampCol)) c.setRGB(lampCol.r, lampCol.g, lampCol.b);
   });
-  const emissiveMat = new MeshBasicMaterial({ vertexColors: true, toneMapped: false });
+  const emissiveTint = new Vector4(1, 1, 1, 1);
+  const emissiveMat = envShaderMaterial({ name: 'env-emissive', kind: KIND.emissive, uniforms: { uTint: { value: emissiveTint } }, depthWrite: true });
   add('env-emissive', emiGeo, emissiveMat);
 
   // --- décor atlas (chalkboard, clock, sign, labels)
@@ -107,7 +108,7 @@ export function buildSet(glow: GlowBatch, blobs: BlobBatch, anisotropy: number):
     c.g *= Math.max(0.42, tmp.g * 1.15);
     c.b *= Math.max(0.46, tmp.b * 1.15);
   });
-  const decorMat = new MeshBasicMaterial({ map: decorTex, vertexColors: true });
+  const decorMat = surfaceMaterial({ map: decorTex, name: 'env-decor' });
   add('env-decor', decorGeo, decorMat);
   disposables.push(decorTex);
 
@@ -122,13 +123,13 @@ export function buildSet(glow: GlowBatch, blobs: BlobBatch, anisotropy: number):
     for (const [fx, fz, ph, amp] of wr) w += amp * Math.sin(x * fx * 6.28 + z * fz * 6.28 + ph);
     c.copy(tmp).multiplyScalar(w * 0.9);
   });
-  const clothMat = new MeshBasicMaterial({ map: clothTex, vertexColors: true });
+  const clothMat = surfaceMaterial({ map: clothTex, name: 'env-cloth' });
   add('env-cloth', clothGeo, clothMat);
   disposables.push(clothTex);
 
-  // --- velvet close-up mat
+  // --- velvet close-up mat (6 mm slab up to L.mat.top)
   const matTex = makeMatTexture(anisotropy);
-  const matMat = new MeshMatcapMaterial({ matcap: makeMatcap(MATCAPS.velvet), map: matTex });
+  const matMat = surfaceMaterial({ matcap: MATCAPS.velvet, map: matTex, name: 'env-mat' });
   const mat = add('mat', matGeometry(), matMat);
   mat.matrixAutoUpdate = true;
   disposables.push(matTex);
@@ -142,6 +143,9 @@ export function buildSet(glow: GlowBatch, blobs: BlobBatch, anisotropy: number):
   disposables.push(beam.geometry, beam.material);
 
   for (const m of group.children) m.updateMatrix();
+  freezeMatrix(night);
+  freezeMatrix(beam);
+  freezeMatrix(group);
 
   // --- contact shadows
   for (const s of [...stageBlobs, ...room.blobs]) blobs.set(blobs.alloc(), s.x, s.y, s.z, s.sx, s.sz, s.opacity, s.cell, s.rot ?? 0);
@@ -167,13 +171,15 @@ export function buildSet(glow: GlowBatch, blobs: BlobBatch, anisotropy: number):
     { mat: glossyMat, floor: 0.6 },
     { mat: roomMat, floor: 0.75 },
     { mat: decorMat, floor: 0.75 },
-    { mat: emissiveMat, floor: 0.3 },
   ];
 
   return {
     group,
     lit,
     beam,
+    beamTint: beam.material.uniforms.uTint.value as Vector4,
+    emissiveTint,
+    nightClock: night.material.uniforms.uClock.value as Vector4,
     night,
     glows,
     lampGlows,

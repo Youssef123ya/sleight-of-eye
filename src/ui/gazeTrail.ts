@@ -9,6 +9,7 @@ import {
   Mesh,
   ShaderMaterial,
   Vector3,
+  Vector4,
   type Object3D,
 } from '@iwsdk/core';
 import { PAL } from '../art/palette.js';
@@ -25,8 +26,7 @@ attribute float aKind;
 uniform vec3 uP0;
 uniform vec3 uP1;
 uniform vec3 uP2;
-uniform float uTime;
-uniform float uSize;
+uniform vec4 uAnim; // (time, dot size, alpha, -): per-frame scalars in one vector (no boxed uniform writes)
 varying vec2 vUv;
 varying float vA;
 varying float vKind;
@@ -35,6 +35,8 @@ void main() {
   vec3 p;
   float size;
   float a;
+  float uTime = uAnim.x;
+  float uSize = uAnim.y;
   if (aKind < 0.5) {
     float t = fract(aPhase + uTime * 0.32);
     float it = 1.0 - t;
@@ -60,7 +62,7 @@ void main() {
 
 const FS = /* glsl */ `
 uniform vec3 uColor;
-uniform float uAlpha;
+uniform vec4 uAnim;
 varying vec2 vUv;
 varying float vA;
 varying float vKind;
@@ -79,7 +81,7 @@ void main() {
     a = smoothstep(0.72, 0.86, r) * (1.0 - smoothstep(0.86, 1.0, r)) * 0.9;
     hot = 0.0;
   }
-  a *= vA * uAlpha;
+  a *= vA * uAnim.z;
   gl_FragColor = vec4(mix(uColor, vec3(1.0), 0.55 * hot), a);
   #include <colorspace_fragment>
 }`;
@@ -121,8 +123,6 @@ export function disposeTrailGeometry(): void {
   sharedGeo = null;
 }
 
-const _w = new Vector3();
-
 export class GazeTrailHint implements ManagedHint {
   dead = false;
   private readonly mesh: Mesh;
@@ -130,6 +130,7 @@ export class GazeTrailHint implements ManagedHint {
   private readonly p0 = new Vector3();
   private readonly p1 = new Vector3();
   private readonly p2 = new Vector3();
+  private readonly anim = new Vector4(0, 0.0078, 0, 0);
   private alpha = 0;
   private stopping = false;
   private time = 0;
@@ -145,9 +146,7 @@ export class GazeTrailHint implements ManagedHint {
         uP0: { value: this.p0 },
         uP1: { value: this.p1 },
         uP2: { value: this.p2 },
-        uTime: { value: 0 },
-        uSize: { value: 0.0078 },
-        uAlpha: { value: 0 },
+        uAnim: { value: this.anim },
         uColor: { value: new Color(PAL.glintGold) },
       },
       vertexShader: VS,
@@ -184,17 +183,25 @@ export class GazeTrailHint implements ManagedHint {
     } catch {
       src = null;
     }
-    if (src && Number.isFinite(src.x + src.y + src.z)) this.ctx.rig.toLocal(src, this.p0);
-    this.to.getWorldPosition(_w);
-    this.ctx.rig.toLocal(_w, this.p2);
+    const f = this.ctx.frame;
+    if (src && Number.isFinite(src.x + src.y + src.z)) f.toLocal(src, this.p0);
+    // the target's world matrix as the renderer left it (≤ 1 frame stale): no recomposition, no allocation
+    f.objectLocal(this.to, this.p2);
     // arc up and over (clears the audience heads on the way to a gadget)
-    const d = this.p0.distanceTo(this.p2);
-    this.p1.addVectors(this.p0, this.p2).multiplyScalar(0.5);
-    this.p1.y = Math.max(this.p0.y, this.p2.y) + 0.06 + 0.28 * d;
+    const p0 = this.p0;
+    const p2 = this.p2;
+    const dx = p2.x - p0.x;
+    const dy = p2.y - p0.y;
+    const dz = p2.z - p0.z;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const p1 = this.p1;
+    p1.x = (p0.x + p2.x) * 0.5;
+    p1.y = Math.max(p0.y, p2.y) + 0.06 + 0.28 * d;
+    p1.z = (p0.z + p2.z) * 0.5;
     // shrink the arc when the gaze is already nearly there
     const near = clamp01(d / 0.12);
-    this.mat.uniforms.uAlpha.value = this.alpha * (0.35 + 0.65 * near);
-    this.mat.uniforms.uTime.value = this.time;
+    this.anim.x = this.time;
+    this.anim.z = this.alpha * (0.35 + 0.65 * near);
     this.mesh.visible = true;
   }
 

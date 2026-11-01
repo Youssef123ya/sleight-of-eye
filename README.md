@@ -1,45 +1,38 @@
-# IWSDK App
+# Sleight of Eye
 
-This project uses `iwsdk.config.json` for declarative scene, asset, component,
-XR, and emulator configuration. Application systems remain explicit in
-`src/index.ts`.
+Close-up magic for a tiny felt audience that looks wherever you look.
+
+[Play in Quest Browser](https://youssef123ya.github.io/sleight-of-eye/)
+
+You are the magician at a midnight café. Lift a coin, guide the audience's attention with your gaze, and palm it while they look away. Three acts introduce fox kits, a magpie drawn to shiny things, and a critic who watches your hands. Getting caught rewinds the trick so you can try another plan.
+
+## Playing
+
+Enter with hand tracking enabled and sit comfortably. Pinch to lift or palm a prop, then poke the highlighted target to reveal it. Look at the music box, candle, or firework to distract the audience. The table plaques offer Retry, Easy Audience, Assist, Recenter, and Exit. Assist supports gaze and a pinch with either hand.
+
+Quest uses head direction for gaze; an eye-gaze input source is used when the WebXR runtime provides one. The experience is built with Meta's Immersive Web SDK and runs from a URL.
+
+## Development
+
+Use the Node version in `.nvmrc`.
 
 ```sh
-npm install
+npm ci
+npm run typecheck
 npm run dev
 ```
 
-Use the Runtime and Editor controls in the managed browser to switch between
-the running experience and its authored scene.
+For the existing automated emulator harness and footage capture, `npm run dev:local` serves HTTP on `127.0.0.1:8081`. Stop another runtime for this workspace first with `npm run dev:down`.
 
-## Starter content
+```sh
+node tests/run-all.mjs
+npm run build
+```
 
-The robot and welcome panel are small examples of authored scene content plus
-runtime systems. The robot turns toward the player's head and plays a sound
-when pressed. To remove the robot, delete its scene node, its `RobotSystem`
-registration from `src/index.ts` or `src/index.js`, and its `Robot` registration
-from `src/components.ts` or `src/components.js`; you can then delete the unused
-robot component and system files. To remove the welcome panel, delete its scene
-node and its `PanelSystem` registration from the application entry point.
+The tests drive Meta's Immersive Web Emulator in installed Chrome. They cover all three acts, caught rewinds, pause/resume, audio lifecycle, autosave, Exit/re-entry, geometric field-of-view fit, and rendering budgets. Desktop emulator timings do not establish physical Quest performance; the glasses field-of-view checks establish layout fit, not hardware validation.
 
-The robot stands on the second of three numbered stations. The first holds dark
-pieces you can grab and move, and the third holds a ring you can spin in place.
-The studio props (the plinths and the dark pieces, plus the floor and stage in VR
-and Desktop 3D) are built in code in `src/scene-assets/studio.scene-asset.ts` or
-`.js`. The VR and Desktop 3D background furniture is built the same way in
-`src/scene-assets/decor.scene-asset.ts` or `.js`, so the starter downloads no
-extra models. To remove any of them, delete their scene nodes and their entries
-in `src/assets.ts` or `src/assets.js`, then delete the files you no longer use.
-The station labels are `public/ui/label-*.uikitml`.
+## Trailer tooling
 
-The rest of the look is built-in components in the scene, which you can edit in
-the editor without code. The soft light on every object is the scene root's
-`IBLGradient` (select the Level Root to edit it), and the soft shadows under
-each object are `ContactShadow` nodes. In VR and Desktop 3D, the sky is the
-scene root's `DomeGradient` (its colors, tilt and dither are also on the Level
-Root), and the floor fades into it through the `DomeFade` on the floor node. AR
-projects have no sky or floor, so passthrough stays visible, and a
-`ShadowCatcher` node grounds the stations.
+`capture/film-takes.mjs` records real emulator gameplay and game audio with semantic edit marks. It requires the local development server and saves takes under ignored `captures/`. Capture utilities and the recording endpoint are development-only.
 
-- Minimal scene walkthrough: https://iwsdk.dev/guides/01b-minimal-scene.html
-- XR-enabled projects — IWER emulator controls: https://iwsdk.dev/guides/02-testing-experience.html#iwer-controls
+The café, puppets, effects, music, and foley are procedural. Third-party font, input-model, and library credits are in [CREDITS.md](CREDITS.md).

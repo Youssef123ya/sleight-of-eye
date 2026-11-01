@@ -11,7 +11,6 @@ import {
   CapsuleGeometry,
   ConeGeometry,
   Mesh,
-  MeshBasicMaterial,
   SphereGeometry,
   type Object3D,
   SRGBColorSpace,
@@ -20,12 +19,12 @@ import {
 } from '@iwsdk/core';
 import type { FxKind, GadgetId, Glint, PropId } from '../contracts.js';
 import { mergeParts } from '../art/geometry.js';
-import { feltMaterial } from '../art/matcap.js';
 import { PAL } from '../art/palette.js';
 import { onUpdate } from '../boot/loop.js';
 import { L, StageRig } from '../layout.js';
 import { environmentFactory } from '../environment/factory.js';
 import type { CafeImpl } from '../environment/cafe.js';
+import { surfaceMaterial } from '../environment/surface.js';
 import { atlasQuad } from '../environment/util.js';
 
 type Ev = { t: number; run: () => void };
@@ -211,7 +210,7 @@ function addStandInAudience(cafe: CafeImpl): void {
       { geometry: new ConeGeometry(0.01 * s, 0.024 * s, 10), color: c, position: [p.x + 0.016 * s, p.y + 0.122 * s, p.z] as [number, number, number], rotation: [0, 0, -0.35] as [number, number, number] },
     ];
   });
-  const m = new Mesh(mergeParts(parts), feltMaterial());
+  const m = new Mesh(mergeParts(parts), surfaceMaterial({ matcap: 'felt', fuzz: 0.07 })); // café surface program
   m.name = 'demo-standInAudience';
   cafe.root.add(m);
 }
@@ -260,11 +259,11 @@ function addPlaceholderPosters(cafe: CafeImpl): void {
   const parts = [-0.33, 0, 0.33].flatMap((x, i) => [
     { geometry: atlasQuad(w, h, [i / 3, 0, (i + 1) / 3, 1]), color: 0xffffff, position: [x, 0, 0.0065] as [number, number, number] },
   ]);
-  const mesh = new Mesh(mergeParts(parts, { keepUv: true }), new MeshBasicMaterial({ map: tex, vertexColors: true }));
+  const mesh = new Mesh(mergeParts(parts, { keepUv: true }), surfaceMaterial({ map: tex }));
   mesh.name = 'demo-placeholderPosters';
   const frames = new Mesh(
     mergeParts([-0.33, 0, 0.33].map((x) => ({ geometry: new BoxGeometry(w + 0.024, h + 0.024, 0.008), color: 0x3a2416, position: [x, 0, 0] as [number, number, number] }))),
-    new MeshBasicMaterial({ vertexColors: true }),
+    surfaceMaterial(),
   );
   frames.name = 'demo-posterFrames';
   cafe.posterWall.add(frames, mesh);

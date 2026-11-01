@@ -1,8 +1,12 @@
 // The Cafe: owns the static set, props, gadgets, anchors, the shared glow/blob batches and the FX.
 // Everything is parented under rig.root in rig-local (L) coordinates.
-import { Group, MeshBasicMaterial, MeshMatcapMaterial, Object3D, Vector3, type Texture, type World } from '@iwsdk/core';
+// Shader programs for the whole module: 2 (surface.ts for every opaque surface, shader.ts for every custom effect).
+// Per-frame safe: no getWorldPosition / localToWorld / worldToLocal (they recompose the IWSDK rig entity and
+// allocate); the camera is read from its current matrixWorld through the shared RigFrame.
+import { Group, Object3D, Vector3, type Texture, type World } from '@iwsdk/core';
 import type { Cafe, GadgetId, PropId } from '../contracts.js';
-import { feltMaterial, makeMatcap, matcapMaterial, type MatcapSpec } from '../art/matcap.js';
+import type { MatcapSpec } from '../art/matcap.js';
+import { rigFrame, type RigFrame } from '../game/space.js';
 import { L, type StageRig, type V3 } from '../layout.js';
 import { FxImpl } from './fx.js';
 import { Candle, Firework, MusicBox } from './gadgets.js';
@@ -10,8 +14,9 @@ import { BlobBatch, GlowBatch, MODE } from './glow.js';
 import { buildProps, makePropMaterials, type PropImpl, type PropsResult } from './props.js';
 import { buildSet, type LitMaterial, type SetResult } from './set.js';
 import type { StaticGlow } from './set-common.js';
+import { disposeSurfaceShared, surfaceMaterial } from './surface.js';
 import { CELL, makeGlowAtlas } from './textures.js';
-import { TAU, approach, clamp01, easeInOutCubic, rng } from './util.js';
+import { TAU, FrameClock, approach, cameraInRig, clamp01, easeInOutCubic, freezeMatrix, rng } from './util.js';
 
 type AnyGadget = MusicBox | Candle | Firework;
 
@@ -19,6 +24,8 @@ type AnyGadget = MusicBox | Candle | Firework;
 const COPPER_MATCAP: MatcapSpec = {
   base: 0x5a2410, key: 0xffb070, keyStrength: 1.05, rim: 0xff9a5a, rimStrength: 0.55, rimPower: 2.2, spec: 1.5, specSize: 0.22,
 };
+/** Emissive bulbs at lamp level 0 keep this much of their glow. */
+const EMISSIVE_FLOOR = 0.3;
 
 interface Mote {
   x: number;
@@ -44,7 +51,7 @@ export class CafeImpl implements Cafe {
   readonly fx: FxImpl;
 
   private readonly world: World;
-  private readonly rig: StageRig;
+  private readonly frame: RigFrame;
   private readonly glow: GlowBatch;
   private readonly blobs: BlobBatch;
   private readonly set: SetResult;
@@ -56,9 +63,11 @@ export class CafeImpl implements Cafe {
   private readonly cam = new Vector3();
   private readonly gadgetList: AnyGadget[];
   private readonly lampGlowList: StaticGlow[];
+  private readonly twinkleGlows: StaticGlow[];
   private readonly atlas: Texture;
   private readonly ownedMaterials: Array<{ dispose(): void }>;
   private now = 0;
+  private readonly clock = new FrameClock();
   private lastTime = Number.NaN;
   private lampTarget = 1;
   private lamp = 1;
@@ -71,11 +80,13 @@ export class CafeImpl implements Cafe {
 
   constructor(world: World, rig: StageRig) {
     this.world = world;
-    this.rig = rig;
+    this.frame = rigFrame(rig);
     this.root.name = 'cafe';
     this.decals.name = 'env-decals';
     this.fxGroup.name = 'env-fx';
     rig.root.add(this.root, this.decals, this.fxGroup);
+    freezeMatrix(this.decals);
+    freezeMatrix(this.fxGroup);
 
     const atlas = makeGlowAtlas();
     this.atlas = atlas;
@@ -88,7 +99,7 @@ export class CafeImpl implements Cafe {
     this.set = buildSet(this.glow, this.blobs, aniso);
     this.root.add(this.set.group);
 
-    // --- anchors
+    // --- anchors (other modules parent into these and may move them: keep them auto-updated)
     L.seats.forEach((p, i) => {
       const s = new Object3D();
       s.name = `seat-${i}`;
@@ -117,9 +128,10 @@ export class CafeImpl implements Cafe {
     const propsGroup = new Group();
     propsGroup.name = 'env-props';
     this.root.add(propsGroup);
-    const metal = matcapMaterial('brass');
-    const felt = feltMaterial();
-    const copper = new MeshMatcapMaterial({ matcap: makeMatcap(COPPER_MATCAP), vertexColors: true });
+    freezeMatrix(propsGroup);
+    const metal = surfaceMaterial({ matcap: 'brass', name: 'env-propMetal' });
+    const felt = surfaceMaterial({ matcap: 'felt', fuzz: 0.07, name: 'env-propFelt' });
+    const copper = surfaceMaterial({ matcap: COPPER_MATCAP, name: 'env-propCopper' });
     const pm = makePropMaterials(metal, felt, copper);
     this.propsRes = buildProps({ rig, glow: this.glow, blobs: this.blobs, fx: this.fx }, propsGroup, pm);
     this.props = this.propsRes.props;
@@ -128,6 +140,7 @@ export class CafeImpl implements Cafe {
     const gadgetsGroup = new Group();
     gadgetsGroup.name = 'env-gadgets';
     this.root.add(gadgetsGroup);
+    freezeMatrix(gadgetsGroup);
     const genv = { rig, glow: this.glow, blobs: this.blobs, fx: this.fx };
     this.gadgets = {
       musicBox: new MusicBox(genv, gadgetsGroup),
@@ -137,9 +150,19 @@ export class CafeImpl implements Cafe {
     this.gadgetList = [this.gadgets.musicBox, this.gadgets.candle, this.gadgets.firework];
     for (const g of this.gadgetList) this.compactFrom.push([g.root.position.x, g.root.position.y, g.root.position.z]);
 
-    this.lit = [...this.set.lit, { mat: metal, floor: 0.55 }, { mat: felt, floor: 0.5 }, { mat: copper, floor: 0.55 }];
+    this.lit = [
+      ...this.set.lit,
+      { mat: metal, floor: 0.55 },
+      { mat: felt, floor: 0.5 },
+      { mat: copper, floor: 0.55 },
+      { mat: pm.lacquer, floor: 0.5 },
+      { mat: pm.dial, floor: 0.55 },
+      { mat: pm.hand, floor: 0.55 },
+    ];
     this.lampGlowList = [this.set.lampGlows.pool, this.set.lampGlows.halo, this.set.lampGlows.core];
-    this.ownedMaterials = [metal, felt, copper, pm.dial, pm.hand, (pm.dial as MeshBasicMaterial).map!];
+    this.twinkleGlows = this.set.glows.filter((s) => s.twinkle > 0);
+    const dialMap = pm.dial.map;
+    this.ownedMaterials = [metal, felt, copper, pm.dial, pm.hand, pm.lacquer, ...(dialMap ? [dialMap] : [])];
 
     // --- dust motes drifting in the lamp light
     const r = rng(77);
@@ -148,7 +171,7 @@ export class CafeImpl implements Cafe {
       const coneR = 0.08 + (0.4 - y) * 0.42;
       const a = r() * TAU;
       const rr = Math.sqrt(r()) * coneR * 0.85;
-      this.motes.push({
+      const m: Mote = {
         x: L.lamp[0] + Math.cos(a) * rr,
         y,
         z: L.lamp[2] + Math.sin(a) * rr,
@@ -159,7 +182,9 @@ export class CafeImpl implements Cafe {
         rate: 0.15 + r() * 0.25,
         size: 0.0022 + r() * 0.0022,
         slot: this.glow.alloc(),
-      });
+      };
+      this.glow.set(m.slot, m.x, m.y, m.z, m.size, m.size, 1, 0.82, 0.55, 0, CELL.dot, MODE.billboard);
+      this.motes.push(m);
     }
     this.update(0, 0);
   }
@@ -192,13 +217,18 @@ export class CafeImpl implements Cafe {
   private tick(dt: number, time: number): void {
     this.now += dt;
     const now = this.now;
+    const clock = this.clock;
+    clock.dt = dt;
+    clock.time = time;
+    clock.now = now;
     const xr = this.world.renderer.xr;
     const presenting = !!xr?.isPresenting;
     if (presenting && !this.wasPresenting) this.fx.warmUp(3);
     this.wasPresenting = presenting;
 
-    this.world.camera.getWorldPosition(this.cam);
-    this.rig.root.worldToLocal(this.cam);
+    // camera in rig space (upright billboards), from its current matrixWorld: no entity recomposition
+    this.frame.sync();
+    cameraInRig(this.world.camera, this.frame, this.cam);
 
     // compact-stage transition (gadgets glide in and up on their brass posts)
     if (this.compactT < 1) {
@@ -214,44 +244,65 @@ export class CafeImpl implements Cafe {
       }
     }
 
-    this.propsRes.update(dt, now);
-    for (const g of this.gadgetList) g.update(dt, time);
+    this.propsRes.step(clock);
+    for (let i = 0; i < this.gadgetList.length; i++) this.gadgetList[i].update(dt, time);
 
     // lamp level
     this.lamp += (this.lampTarget - this.lamp) * approach(5, dt);
     if (Math.abs(this.lamp - this.lampApplied) > 0.002) {
       this.lampApplied = this.lamp;
-      for (const { mat, floor } of this.lit) mat.color.setScalar(floor + (1 - floor) * this.lamp);
-      this.set.beam.material.uniforms.uLevel.value = this.lamp;
+      const lit = this.lit;
+      for (let i = 0; i < lit.length; i++) {
+        const f = lit[i].floor;
+        const c = lit[i].mat.color;
+        const k = f + (1 - f) * this.lamp;
+        c.r = k;
+        c.g = k;
+        c.b = k;
+      }
+      const ek = EMISSIVE_FLOOR + (1 - EMISSIVE_FLOOR) * this.lamp;
+      const et = this.set.emissiveTint;
+      et.x = ek;
+      et.y = ek;
+      et.z = ek;
+      this.set.beamTint.w = this.lamp;
       this.set.beam.visible = this.lamp > 0.02;
     }
 
-    // static glows: lamp halo/pool follow the lamp; fairy lights & candles twinkle
+    // static glows: lamp halo/pool follow the lamp; fairy lights & candles twinkle (size/alpha only)
     const glow = this.glow;
     const lampK = this.lamp;
-    for (const s of this.lampGlowList) {
-      const breathe = 1 + 0.015 * Math.sin(now * 1.3);
-      glow.set(s.slot, s.x, s.y, s.z, s.size * breathe, s.size * breathe, s.r, s.g, s.b, s.a * lampK, s.cell, s.mode);
+    const breathe = 1 + 0.015 * Math.sin(now * 1.3);
+    const lg = this.lampGlowList;
+    for (let i = 0; i < lg.length; i++) {
+      const s = lg[i];
+      glow.setSizeAlpha(s.slot, s.size * breathe, s.size * breathe, s.a * lampK);
     }
-    for (const s of this.set.glows) {
-      if (!s.twinkle) continue;
+    const tg = this.twinkleGlows;
+    for (let i = 0; i < tg.length; i++) {
+      const s = tg[i];
       const tw = 1 - s.twinkle * (0.5 + 0.5 * Math.sin(now * s.rate * TAU + s.phase));
-      const k = s.cell === CELL.flame ? 0.85 + 0.15 * Math.sin(now * 23 + s.phase) : 1;
-      glow.set(s.slot, s.x, s.y, s.z, s.size * (s.cell === CELL.flame ? 0.55 : 1), s.size * k, s.r, s.g, s.b, s.a * tw, s.cell, s.mode);
+      const flame = s.cell === CELL.flame;
+      const k = flame ? 0.85 + 0.15 * Math.sin(now * 23 + s.phase) : 1;
+      glow.setSizeAlpha(s.slot, s.size * (flame ? 0.55 : 1), s.size * k, s.a * tw);
     }
-    for (const m of this.motes) {
+    const motes = this.motes;
+    for (let i = 0; i < motes.length; i++) {
+      const m = motes[i];
       const t = now * m.rate + m.ph;
-      const x = m.x + Math.sin(t * 1.3) * m.ax;
-      const y = m.y + Math.sin(t * 0.9 + 1.7) * m.ay;
-      const z = m.z + Math.cos(t * 1.1) * m.az;
       const sparkle = Math.max(0, Math.sin(now * (0.6 + m.rate * 2) + m.ph * 3));
-      const a = (0.12 + 0.6 * sparkle * sparkle * sparkle) * lampK;
-      glow.set(m.slot, x, y, z, m.size, m.size, 1, 0.82, 0.55, a, CELL.dot, MODE.billboard);
+      glow.setPosAlpha(
+        m.slot,
+        m.x + Math.sin(t * 1.3) * m.ax,
+        m.y + Math.sin(t * 0.9 + 1.7) * m.ay,
+        m.z + Math.cos(t * 1.1) * m.az,
+        (0.12 + 0.6 * sparkle * sparkle * sparkle) * lampK,
+      );
     }
 
-    this.set.night.material.uniforms.uTime.value = now;
-    this.fx.update(dt, time);
-    this.glow.sync(this.cam);
+    this.set.nightClock.x = now;
+    this.fx.step(clock);
+    glow.sync(this.cam);
     this.blobs.sync();
   }
 
@@ -270,6 +321,7 @@ export class CafeImpl implements Cafe {
     this.blobs.dispose();
     for (const m of this.ownedMaterials) m.dispose();
     this.atlas.dispose();
+    disposeSurfaceShared();
     this.root.removeFromParent();
     this.decals.removeFromParent();
     this.fxGroup.removeFromParent();

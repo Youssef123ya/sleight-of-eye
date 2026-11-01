@@ -1,7 +1,7 @@
 // Red velvet theatre curtain across the front of the riser: two pleated traveller panels that slide in from
 // the wings (and bunch up as they leave) plus a swagged valance with gold fringe. Hides the audience and the
 // gadgets, never the mat. Everything is computed in one vertex shader → one opaque draw call, hidden when open.
-import { BufferAttribute, BufferGeometry, Mesh, ShaderMaterial, Vector3 } from '@iwsdk/core';
+import { BufferAttribute, BufferGeometry, Mesh, ShaderMaterial, Vector3, Vector4 } from '@iwsdk/core';
 import type { Cafe } from '../contracts.js';
 import { L } from '../layout.js';
 import { clamp01, deferred, easeInOutCubic, type Deferred } from './anim.js';
@@ -19,10 +19,7 @@ const VS = /* glsl */ `
 attribute vec2 aUV;
 attribute float aSide;
 attribute float aKind;
-uniform float uOpen;
-uniform float uDrop;
-uniform float uTime;
-uniform float uSway;
+uniform vec4 uAnim; // (open, drop, time, sway): per-frame scalars in one vector (no boxed uniform writes)
 uniform vec3 uBase;
 uniform float uWidth;
 uniform float uHeight;
@@ -36,6 +33,10 @@ varying float vFringe;
 const float PLEATS = 7.0;
 const float TAU = 6.2831853;
 void main() {
+  float uOpen = uAnim.x;
+  float uDrop = uAnim.y;
+  float uTime = uAnim.z;
+  float uSway = uAnim.w;
   vec3 p;
   vec3 n;
   float u = aUV.x;
@@ -186,6 +187,7 @@ export class Curtain {
   private sway = 0;
   private time = 0;
   private pending: Deferred | null = null;
+  private readonly anim = new Vector4(1, 0, 0, 0);
 
   constructor(
     ctx: UICtx,
@@ -194,10 +196,7 @@ export class Curtain {
     this.mat = new ShaderMaterial({
       name: 'ui-curtain',
       uniforms: {
-        uOpen: { value: 1 },
-        uDrop: { value: 0 },
-        uTime: { value: 0 },
-        uSway: { value: 0 },
+        uAnim: { value: this.anim },
         uBase: { value: new Vector3(0, L.tableY - 0.004, Z) },
         uWidth: { value: WIDTH },
         uHeight: { value: HEIGHT },
@@ -257,12 +256,12 @@ export class Curtain {
     const visible = this.open < 0.999 || this.t < 1;
     this.mesh.visible = visible;
     if (!visible) return;
-    const u = this.mat.uniforms;
-    u.uOpen.value = this.open;
+    const a = this.anim;
+    a.x = this.open;
     // the valance drops a beat before the panels meet, and lifts as they part
-    u.uDrop.value = clamp01((1 - this.open) * 2.2);
-    u.uTime.value = this.time;
-    u.uSway.value = this.sway;
+    a.y = clamp01((1 - this.open) * 2.2);
+    a.z = this.time;
+    a.w = this.sway;
   }
 
   dispose(): void {

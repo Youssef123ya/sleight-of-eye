@@ -63,21 +63,74 @@ export function damp(cur: number, target: number, rate: number, dt: number): num
   return target + (cur - target) * Math.exp(-rate * dt);
 }
 
-/** Deterministic PRNG (mulberry32): seeded puppets blink and fidget differently but reproducibly. */
-export function makeRng(seed: number): () => number {
-  let a = seed >>> 0 || 0x9e3779b9;
-  return () => {
-    a = (a + 0x6d2b79f5) | 0;
+/**
+ * Deterministic PRNG (mulberry32): seeded puppets blink and fidget differently but reproducibly. A class rather than
+ * a closure: its state lives in an unboxed double field and `next()` inlines (a closure's context slot boxes).
+ */
+export class Rng {
+  private a: number;
+  constructor(seed: number) {
+    this.a = seed >>> 0 || 0x9e3779b9;
+    settleFields(this);
+  }
+  next(): number {
+    const a = (this.a + 0x6d2b79f5) | 0;
+    this.a = a;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+  }
+}
+
+/** Same sequence as `new Rng(seed).next` (kept for callers that want a plain function). */
+export function makeRng(seed: number): () => number {
+  const r = new Rng(seed);
+  return () => r.next();
+}
+
+/**
+ * V8 shape settle — call once at the end of a constructor (or right after building a literal) whose fields per-frame
+ * code reads and writes. A numeric field that starts as a small integer and later receives its first fraction, or a
+ * boolean / string / null field written for the first time after start-up, changes the object's hidden class, and V8
+ * then throws every optimised function that relied on the old shape back to the unoptimised tier, which boxes every
+ * double it computes. Measured in the spectators demo: ALL puppet methods deoptimised each time some puppet first
+ * startled, fidgeted, shuffled or blushed, seconds into the show (≈20 KB of garbage per frame). Writing each field
+ * once more here (a fraction, the flipped boolean, another string, an object instead of null) makes it double-typed
+ * and mutable from birth, so later writes never change the shape. Values are restored; nothing else changes.
+ */
+export function settleFields(o: object): void {
+  const r = o as Record<string, unknown>;
+  for (const k of Object.keys(r)) {
+    const v = r[k];
+    if (typeof v === 'number') r[k] = 0.5;
+    else if (typeof v === 'boolean') r[k] = !v;
+    else if (typeof v === 'string') r[k] = '\u0000';
+    else if (v === null) r[k] = SETTLE_OBJECT;
+    else continue;
+    r[k] = v;
+  }
+}
+const SETTLE_OBJECT = {};
+
+/** Small 3-vectors are Float64Arrays in per-frame code (never three's shared Vector3 helpers). */
+export function set3(v: Float64Array, x: number, y: number, z: number): void {
+  v[0] = x;
+  v[1] = y;
+  v[2] = z;
+}
+export function copy3(dst: Float64Array, src: Float64Array): void {
+  dst[0] = src[0];
+  dst[1] = src[1];
+  dst[2] = src[2];
 }
 
 /** 1-D damped spring (allocation-free). Semi-implicit Euler with small fixed substeps: stable at any frame rate. */
 export class Spring {
   x = 0;
   v = 0;
+  constructor() {
+    settleFields(this);
+  }
   step(target: number, k: number, c: number, dt: number): number {
     if (!(dt > 0)) return this.x;
     const n = Math.min(10, Math.ceil(dt * 240));

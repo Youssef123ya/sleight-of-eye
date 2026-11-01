@@ -31,7 +31,43 @@ export interface DebugExtras {
   recenter(): void;
   /** A spectator object by id (QA probes). */
   spectator(id: string): Spectator | null;
+  /** What the stage shows right now (attract-view checks): UI overlays on screen, curtain, cast, props. */
+  stage(): StageReport;
 }
+
+export interface StageReport {
+  /** Named UI overlays currently shown (newspaper, captions, title card, banner, hints, rewind smear, curtain). */
+  overlays: string[];
+  /** The curtain's target state when the UI reports it (null: unknown). */
+  curtainClosed: boolean | null;
+  /** Visible spectators with where their attention rule points them (null = their own idle glance). */
+  spectators: Array<{ id: string; seated: boolean; target: [number, number, number] | null }>;
+  /** Visible props and their modes. */
+  props: Record<string, string>;
+  /** Plaques on the table edge (actions shown). */
+  plaques: string[];
+}
+const PLAQUE_NAME = /^plaque-(retry|easy|assist|recenter|exit)$/;
+
+/** UI overlay objects of the real UI (ui-*) and the stub UI that must be gone from a calm attract view. */
+const OVERLAYS = new Set([
+  'ui-review',
+  'review',
+  'ui-title-card',
+  'title-card',
+  'ui-banner',
+  'banner',
+  'ui-rewind',
+  'rewind-smear',
+  'ghost-hand',
+  'gaze-trail',
+  'ui-curtain',
+  'curtain',
+  'ui-spotlight',
+  'gaze-spotlight',
+]);
+const isOverlay = (name: string) =>
+  OVERLAYS.has(name) || name.startsWith('ui-caption-slot-') || name.startsWith('ui-hint-') || /^caption-\d+$/.test(name);
 
 const EVENT_TYPES: Array<keyof GameEvents> = [
   'gaze:focus',
@@ -167,6 +203,10 @@ export function installDebugApi(d: DebugDeps): DebugApi & DebugExtras {
         hint: hints.showing,
         revealTarget: runner.revealTargetId,
         assistRabbit: !!runner.rabbit?.root.visible,
+        attract: runner.attracting,
+        audienceIdle: attention.isIdle,
+        musicBoxPlaying: runner.musicBoxPlaying,
+        said: runner.said.slice(-6),
       };
     },
     skipTo(act: number, beat?: number) {
@@ -232,6 +272,46 @@ export function installDebugApi(d: DebugDeps): DebugApi & DebugExtras {
     },
     spectator(id: string) {
       return runner.spectators.get(id) ?? null;
+    },
+    stage() {
+      const overlays: string[] = [];
+      const shown = (o: Object3D) => {
+        for (let p: Object3D | null = o; p; p = p.parent) if (!p.visible) return false;
+        return true;
+      };
+      const plaques: string[] = [];
+      ctx.world.scene.traverse((o) => {
+        if (!o.name) return;
+        if (isOverlay(o.name) && shown(o)) overlays.push(o.name);
+        const m = PLAQUE_NAME.exec(o.name);
+        if (m && shown(o) && !plaques.includes(m[1])) plaques.push(m[1]);
+      });
+      const closed = (ctx.ui as { curtainClosed?: unknown }).curtainClosed;
+      const spectators: StageReport['spectators'] = [];
+      for (const [id, s] of runner.spectators) {
+        if (!s.root.visible) continue;
+        const w = attention.watcher(id);
+        // home = the eyes stand over its seat (puppets hop inside a root that never moves)
+        const seatIndex = runner.actDef.cast.find((c) => c.id === id)?.seat;
+        const seat = seatIndex === undefined ? null : ctx.cafe.seats[seatIndex];
+        let seated = false;
+        if (seat) {
+          try {
+            s.getEyeWorldPosition(v);
+            seat.getWorldPosition(head);
+            seated = Math.hypot(v.x - head.x, v.z - head.z) < 0.06;
+          } catch {
+            seated = false;
+          }
+        }
+        spectators.push({ id, seated, target: w && w.hasTarget ? r3(w.target) : null });
+      }
+      const propsShown: Record<string, string> = {};
+      for (const id of PROP_IDS) {
+        const p = ctx.cafe.props[id];
+        if (p?.root.visible) propsShown[id] = props.mode(id);
+      }
+      return { overlays, curtainClosed: typeof closed === 'boolean' ? closed : null, spectators, props: propsShown, plaques };
     },
   };
   window.__app = api;

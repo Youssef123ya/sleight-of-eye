@@ -1,6 +1,7 @@
 // The whole show end to end, no skipTo: landing → Enter (tests/shot.mjs --xr clicks the landing's Enter button)
 // → calibration on the first stable XR frames → Act I → Act II (with one magpie catch) → Act III → the bow
-// (review + poster + Retry/Exit plaques) → Exit plaque → back on the landing page.
+// (review + poster + Retry/Exit plaques) → Exit plaque → back on the landing page over the calm attract view
+// → Enter again: a new show from Act I.
 //   node tests/shot.mjs --url="http://127.0.0.1:8081/" --xr --head=0,1.2,0 --look=0,0.9,-0.45 \
 //        --scenario=tests/scenarios/core-show.mjs --out=tests/out/core-show.png
 // Works on ?demo=core (stubs) too. ~3 minutes.
@@ -11,10 +12,11 @@ import { makeHelpers } from './core-lib.mjs';
 
 export default async function show(page, api) {
   const h = makeHelpers(page, api);
-  const { note, waitFor, check, state, events, where, poke, add, failures, timeline } = h;
+  const { note, waitFor, check, state, events, where, poke, add, failures, timeline, checkAttract, reenter } = h;
   const landingShown = () =>
     page.evaluate(() => {
-      const el = document.getElementById('landing') ?? document.getElementById('landing-stub');
+      // ?demo=core mounts the stub landing; index.html's own #landing stays hidden in demo mode
+      const el = document.getElementById('landing-stub') ?? document.getElementById('landing');
       if (!el) return null;
       const cs = getComputedStyle(el);
       return !el.classList.contains('is-hidden') && cs.display !== 'none' && cs.visibility !== 'hidden' && el.getAttribute('aria-hidden') !== 'true';
@@ -57,7 +59,17 @@ export default async function show(page, api) {
       s = await waitFor((x) => !x.immersive, 5000, 'Exit plaque → leaves XR');
       await page.waitForTimeout(600);
       check((await landingShown()) !== false, 'the landing page is back after exiting', { shown: await landingShown() });
+      await page.waitForTimeout(1200); // the curtain finishes opening
+      // behind the landing page: the calm attract view, not the bow (no newspaper, Act I's kits, the coin)
+      await checkAttract('after the bow and Exit');
       await api.shot('core-show-landing-after-exit');
+      // back in from a finished show: tonight's show starts over at Act I
+      await reenter();
+      s = await waitFor((x) => x.immersive && x.calibrated && x.started && x.act === 1 && x.beat === 0, 20000, 're-Enter after the bow → a new show from Act I');
+      check(s.stars.every((n) => n === 0) && s.caught === 0 && !s.reviewShown, 'a fresh show: no stars, catches or review yet', {
+        stars: s.stars,
+        caught: s.caught,
+      });
     }
   } catch (e) {
     if (!failures.includes(String(e?.message ?? e))) failures.push(String(e?.message ?? e));

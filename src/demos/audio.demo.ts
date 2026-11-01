@@ -14,7 +14,8 @@
 //                      document.title, the in-world report board, and ONE console.warn line
 //                      "[audio-report] {json}" — tests/shot.mjs prints console warnings in its JSON output, so
 //                      `node tests/shot.mjs --url=...?demo=audio&render=1 --wait=30000` captures both.
-//   window.__audio     debug view of the live engine (state, voices, panners, stats, meter, listener owner, engine)
+//   window.__audio     READ-ONLY debug info about the live engine (state, voices, panners, stats, music boxes playing,
+//                      music mood, tension, listener owner, meter()): no controls; the demo drives the engine itself
 //   &ui=0              hide the DOM panel (clean screenshots)
 import {
   BoxGeometry,
@@ -418,6 +419,20 @@ export default async function audioDemo(world: World): Promise<void> {
         setTimeout(() => setSustain('musicBox', false), 5200);
       },
     },
+    {
+      st: 'musicBox',
+      label: 'musicBox (∞, Easy Audience) → handle.stop() after 3.5 s',
+      secs: 4.3,
+      run: () => {
+        setSustain('musicBox', true);
+        const box = audio.musicBox(at('musicBox'), Infinity);
+        setTimeout(() => {
+          box.stop(); // the lid closes: a 120 ms fade
+          box.stop(); // idempotent
+          setSustain('musicBox', false);
+        }, 3500);
+      },
+    },
     sfx('flare', 'candle', 2.1),
     {
       st: 'fuse',
@@ -513,10 +528,14 @@ export default async function audioDemo(world: World): Promise<void> {
     setSustain('music', true);
     const st = dbg.stats;
     const silent = results.filter((r) => r.peak <= 0).map((r) => r.label);
-    const summary = { context: dbg.state, steps: results.length, silentSteps: silent.length, maxPeak: Math.max(...results.map((r) => r.peak)), stats: st, results };
+    // every box the tour opened has ended or been stopped by now (an endless one left open would still count)
+    const boxes = dbg.musicBoxes;
+    const summary = { context: dbg.state, steps: results.length, silentSteps: silent.length, maxPeak: Math.max(...results.map((r) => r.peak)), musicBoxes: boxes, stats: st, results };
     console.log('[audio-tour] done', summary);
     // a warning so headless runs (tests/shot.mjs) capture the live-path result
-    console.warn(`[audio-tour] ${JSON.stringify({ context: summary.context, steps: summary.steps, silentSteps: silent, maxPeak: summary.maxPeak, stats: st })}`);
+    console.warn(
+      `[audio-tour] ${JSON.stringify({ context: summary.context, steps: summary.steps, silentSteps: silent, maxPeak: summary.maxPeak, musicBoxes: boxes, stats: st })}`,
+    );
     touring = false;
     button.disabled = false;
     button.textContent = '▶ Replay the sound tour';

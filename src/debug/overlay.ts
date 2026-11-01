@@ -14,12 +14,10 @@
 import {
   CanvasTexture,
   Group,
-  Matrix4,
   Mesh,
   MeshBasicMaterial,
   PlaneGeometry,
   SRGBColorSpace,
-  Vector3,
   type Entity,
   type World,
 } from '@iwsdk/core';
@@ -197,6 +195,8 @@ function createOverlay(world: World, opts: DebugOverlayOptions): DebugOverlayHan
   mesh.renderOrder = 10_000;
   mesh.frustumCulled = false;
   mesh.userData.iwsdkRuntimeOnly = true; // keep it out of IWER target bounds
+  // follow() writes the local matrix itself (basis + position): no per-frame quaternion → Euler sync
+  mesh.matrixAutoUpdate = false;
   // A static holder entity at the world origin; the panel is a plain child, so moving it every frame never goes
   // through the ECS-synced transform accessors (and never walks an entity parent chain).
   const holder = new Group();
@@ -250,13 +250,6 @@ function createOverlay(world: World, opts: DebugOverlayOptions): DebugOverlayHan
   };
 
   // ---------------------------------------------------------------------------------------- follow state
-  const headPos = new Vector3();
-  const fwd = new Vector3();
-  const rel = new Vector3();
-  const axisX = new Vector3();
-  const axisY = new Vector3();
-  const axisZ = new Vector3();
-  const basis = new Matrix4();
   let placed = false;
   let following = false;
   let wasPresenting = false;
@@ -324,22 +317,36 @@ function createOverlay(world: World, opts: DebugOverlayOptions): DebugOverlayHan
       snapIn = 3; // the camera carries the XR viewer pose only after the next renders
     }
     if (snapIn > 0 && --snapIn === 0) placed = false;
-    // the renderer refreshed the camera's matrixWorld from the viewer pose last frame (one frame of lag is fine)
+    // Plain float maths on locals with direct field / element writes: no three.js calls, so V8 has nothing to box
+    // (a call it does not inline boxes its double arguments and return value: real per-frame garbage).
+    // The renderer refreshed the camera's matrixWorld from the viewer pose last frame (one frame of lag is fine).
     const e = cam.matrixWorld.elements;
-    headPos.set(e[12], e[13], e[14]);
-    fwd.set(-e[8], -e[9], -e[10]).normalize();
-    if (Math.abs(fwd.y) < 0.97) F[DESIRED_YAW] = Math.atan2(fwd.x, -fwd.z) + yawOff;
+    const hx = e[12];
+    const hy = e[13];
+    const hz = e[14];
+    let fx = -e[8];
+    let fy = -e[9];
+    let fz = -e[10];
+    const fl = Math.sqrt(fx * fx + fy * fy + fz * fz) || 1;
+    fx /= fl;
+    fy /= fl;
+    fz /= fl;
+    if (Math.abs(fy) < 0.97) F[DESIRED_YAW] = Math.atan2(fx, -fz) + yawOff;
     const desiredYaw = F[DESIRED_YAW];
-    const headPitch = Math.asin(Math.max(-1, Math.min(1, fwd.y)));
+    const headPitch = Math.asin(fy < -1 ? -1 : fy > 1 ? 1 : fy);
     const desiredPitch = Math.max(-80 * DEG, Math.min(60 * DEG, headPitch + pitchOff));
 
-    rel.copy(mesh.position).sub(headPos);
-    let dist = rel.length();
+    const p = mesh.position;
+    const rx = p.x - hx;
+    const ry = p.y - hy;
+    const rz = p.z - hz;
+    let dist = Math.sqrt(rx * rx + ry * ry + rz * rz);
     let curYaw = desiredYaw;
     let curPitch = desiredPitch;
     if (placed && dist > 1e-4) {
-      curYaw = Math.atan2(rel.x, -rel.z);
-      curPitch = Math.asin(Math.max(-1, Math.min(1, rel.y / dist)));
+      curYaw = Math.atan2(rx, -rz);
+      const sp = ry / dist;
+      curPitch = Math.asin(sp < -1 ? -1 : sp > 1 ? 1 : sp);
     } else {
       dist = distance;
     }
@@ -356,24 +363,51 @@ function createOverlay(world: World, opts: DebugOverlayOptions): DebugOverlayHan
       const pitch = curPitch + dPitch * k;
       const d = dist + dDist * k;
       const cp = Math.cos(pitch);
-      mesh.position.set(
-        headPos.x + Math.sin(yaw) * cp * d,
-        headPos.y + Math.sin(pitch) * d,
-        headPos.z - Math.cos(yaw) * cp * d,
-      );
+      p.x = hx + Math.sin(yaw) * cp * d;
+      p.y = hy + Math.sin(pitch) * d;
+      p.z = hz - Math.cos(yaw) * cp * d;
       placed = true;
       if (off * (1 - k) < FOLLOW_STOP_DEG * DEG && Math.abs(dDist * (1 - k)) < 0.01) following = false;
     }
-    // face the head, upright: +Z toward the eyes, X level
-    axisZ.copy(headPos).sub(mesh.position);
-    if (axisZ.lengthSq() > 1e-8) {
-      axisZ.normalize();
-      axisX.set(axisZ.z, 0, -axisZ.x); // up x z
-      if (axisX.lengthSq() < 1e-8) axisX.set(1, 0, 0);
-      axisX.normalize();
-      axisY.crossVectors(axisZ, axisX);
-      mesh.quaternion.setFromRotationMatrix(basis.makeBasis(axisX, axisY, axisZ));
+    // face the head, upright: Z toward the eyes, X = up × Z (level), Y = Z × X — straight into the local matrix
+    // (column-major; matrixAutoUpdate is off, so position/quaternion are not recomposed by three)
+    let zx = hx - p.x;
+    let zy = hy - p.y;
+    let zz = hz - p.z;
+    const zl = Math.sqrt(zx * zx + zy * zy + zz * zz);
+    const te = mesh.matrix.elements;
+    if (zl > 1e-4) {
+      zx /= zl;
+      zy /= zl;
+      zz /= zl;
+      let xx = zz;
+      let xz = -zx;
+      const xl = Math.sqrt(xx * xx + xz * xz);
+      if (xl < 1e-4) {
+        xx = 1;
+        xz = 0;
+      } else {
+        xx /= xl;
+        xz /= xl;
+      }
+      te[0] = xx;
+      te[1] = 0;
+      te[2] = xz;
+      te[3] = 0;
+      te[4] = zy * xz;
+      te[5] = zz * xx - zx * xz;
+      te[6] = -zy * xx;
+      te[7] = 0;
+      te[8] = zx;
+      te[9] = zy;
+      te[10] = zz;
+      te[11] = 0;
     }
+    te[12] = p.x;
+    te[13] = p.y;
+    te[14] = p.z;
+    te[15] = 1;
+    mesh.matrixWorldNeedsUpdate = true;
     s.following = following;
   };
 

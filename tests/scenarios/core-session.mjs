@@ -1,14 +1,16 @@
 // Session + accessibility on ?demo=core: pause/resume on visibilityState (curtain, frozen audience, beat clock
-// stops), "Hold it!" while the palming hand is untracked (the palm survives), Retry + Recenter plaques (poked),
-// Assist (the rabbit does the reaching: pinch anywhere; reveals become look + pinch) and Easy Audience
-// (gadget windows last until the move is done).
+// stops, the music box tune stops and picks up again), the music box closing once the move is done, "Hold it!"
+// while the palming hand is untracked (the palm survives), Retry + Recenter plaques (poked), Assist (the rabbit does
+// the reaching: pinch anywhere; reveals become look + pinch) and Easy Audience (gadget windows last until the move
+// is done).
 //   node tests/shot.mjs --url="http://127.0.0.1:8091/?demo=core" --xr --head=0,1.2,0 --look=0,0.9,-0.45 \
 //        --scenario=tests/scenarios/core-session.mjs --out=tests/out/core-session.png
 import { makeHelpers } from './core-lib.mjs';
 
 export default async function session(page, api) {
   const h = makeHelpers(page, api);
-  const { note, waitFor, check, look, turnTo, reach, pinch, poke, where, state, events, add, failures, timeline } = h;
+  const { note, waitFor, check, look, turnTo, reach, pinch, poke, where, state, events, add, failures, timeline, cfg } = h;
+  const CFG = await cfg().catch(() => ({ candleDuration: 7.5 }));
   const visibility = (v) => page.evaluate((x) => window.IWER_DEVICE.updateVisibilityState(x), v);
   const setHand = (connected) => page.evaluate((c) => (window.IWER_DEVICE.hands.right.connected = c), connected);
   const pokePlaque = async (action) => {
@@ -49,11 +51,24 @@ export default async function session(page, api) {
     const grab = add(coin, [0, 0.012, 0]);
     const box = await where('musicBox-focus');
     await turnTo([0, 0.9, -0.45], box, 0.4);
-    await waitFor((x) => x.gadgets.musicBox.active, 4000, 'music box fires');
-    await page.waitForTimeout(1300);
+    s = await waitFor((x) => x.gadgets.musicBox.active, 4000, 'music box fires');
+    check(s.musicBoxPlaying, 'the music box tune plays', { playing: s.musicBoxPlaying });
+    // a pause silences the tune with the frozen box; resuming picks it up again for the rest of its window
+    await visibility('hidden');
+    s = await waitFor((x) => x.paused, 2000, 'hidden → paused (music box playing)');
+    check(!s.musicBoxPlaying && s.gadgets.musicBox.active, 'paused: the tune stops, the box holds its window', {
+      playing: s.musicBoxPlaying,
+      musicBox: s.gadgets.musicBox,
+    });
+    await visibility('visible');
+    s = await waitFor((x) => !x.paused && x.running, 2000, 'visible → resumed');
+    check(s.musicBoxPlaying && s.gadgets.musicBox.active, 'resumed: the tune plays on', { playing: s.musicBoxPlaying });
+    await page.waitForTimeout(1000);
     await reach(add(grab, [0.06, 0.1, 0.12]), grab, 0.6, 0);
     await pinch(1, 0.3);
     await waitFor((x) => x.palmed === 'coin', 2000, 'coin palmed');
+    // the move is done (look-back beat): the music box closes and its tune stops, window time left or not
+    await waitFor((x) => x.beatKind === 'lookBack' && !x.gadgets.musicBox.active && !x.musicBoxPlaying, 2000, 'move done → the music box closes, tune stopped');
     await pinch(0, 0.2);
     await setHand(false);
     s = await waitFor((x) => x.holdIt, 2000, 'palming hand lost → "Hold it!"');
@@ -62,6 +77,7 @@ export default async function session(page, api) {
     await setHand(true);
     s = await waitFor((x) => !x.holdIt && x.running, 3000, 'hand back → show resumes');
     check(s.palmed === 'coin', 'still palmed after the hand returns');
+    check(!s.musicBoxPlaying, 'no tune comes back for a closed box', { playing: s.musicBoxPlaying });
 
     // ------------------------------------------------------------------ Retry plaque: back to the checkpoint
     await turnTo(box, [0, 0.9, -0.42], 0.4);
@@ -106,10 +122,11 @@ export default async function session(page, api) {
     await waitFor((x) => x.act === 2 && x.beatKind === 'steal' && x.phase === 'active', 5000, 'Act II steal (easy)');
     const candle = await where('candle-focus');
     await turnTo([0, 0.9, -0.42], candle, 0.4);
-    await waitFor((x) => x.gadgets.candle.active, 4000, 'candle flares');
-    await page.waitForTimeout(6500); // longer than the 5 s flare
-    s = await state();
-    check(s.gadgets.candle.active, 'Easy Audience: the flare outlasts its 5 s window', { candle: s.gadgets.candle });
+    s = await waitFor((x) => x.gadgets.candle.active, 4000, 'candle flares');
+    // outlast the normal flare (CFG.candleDuration) on the game's own clock, whatever the frame rate
+    const lit = s.beatTime;
+    s = await waitFor((x) => x.beatTime - lit > CFG.candleDuration + 1, (CFG.candleDuration + 6) * 1000, `${CFG.candleDuration + 1} s of flare`);
+    check(s.gadgets.candle.active, `Easy Audience: the flare outlasts its ${CFG.candleDuration} s window`, { candle: s.gadgets.candle });
     const ball = await where('ball');
     const bgrab = add(ball, [0, 0.015, 0]);
     await reach(add(bgrab, [0.06, 0.1, 0.12]), bgrab, 0.5, 0);

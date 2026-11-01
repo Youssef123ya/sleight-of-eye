@@ -15,6 +15,7 @@ import {
   Quaternion,
   ShaderMaterial,
   SphereGeometry,
+  Vector2,
   Vector3,
   type Object3D,
 } from '@iwsdk/core';
@@ -23,6 +24,7 @@ import { mergeParts, type Part } from '../art/geometry.js';
 import { makeMatcap } from '../art/matcap.js';
 import { clamp01, easeInCubic, easeInOutSine, easeOutCubic, lerp, smoothstep } from './anim.js';
 import type { UICtx } from './context.js';
+import { manualMatrix, rot3From, setRotPose } from './xform.js';
 
 type V = [number, number, number];
 type FingerName = 'index' | 'middle' | 'ring' | 'pinky';
@@ -232,20 +234,22 @@ function ghostMaterial(shared: GloveShared): MeshMatcapMaterial {
 }
 
 // ------------------------------------------------------------------------------------------ ripple fx
+// uR = (eased time 0..1, size m): per-frame scalars in one vector (no boxed uniform writes)
 const RIPPLE_VS = /* glsl */ `
-uniform float uSize;
+uniform vec2 uR;
 varying vec2 vUv;
 void main() {
   vUv = uv;
   vec4 mv = modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
-  mv.xy += position.xy * uSize;
+  mv.xy += position.xy * uR.y;
   gl_Position = projectionMatrix * mv;
 }`;
 const RIPPLE_FS = /* glsl */ `
-uniform float uT;
+uniform vec2 uR;
 uniform vec3 uColor;
 varying vec2 vUv;
 void main() {
+  float uT = uR.x;
   vec2 p = vUv * 2.0 - 1.0;
   float r = length(p);
   float rad = mix(0.12, 0.9, uT);
@@ -261,10 +265,12 @@ void main() {
 class Ripple {
   readonly mesh: Mesh;
   private readonly mat: ShaderMaterial;
+  private readonly r = new Vector2(1, 0.03);
   private t = 1;
   constructor(parent: Object3D, geo: PlaneGeometry) {
     this.mat = new ShaderMaterial({
-      uniforms: { uT: { value: 1 }, uSize: { value: 0.03 }, uColor: { value: new Color(0xffe2a0) } },
+      name: 'ui-hint-ripple',
+      uniforms: { uR: { value: this.r }, uColor: { value: new Color(0xffe2a0) } },
       vertexShader: RIPPLE_VS,
       fragmentShader: RIPPLE_FS,
       transparent: true,
@@ -291,8 +297,8 @@ class Ripple {
       return;
     }
     this.t = Math.min(1, this.t + dt / 0.5);
-    this.mat.uniforms.uT.value = easeOutCubic(this.t);
-    this.mat.uniforms.uSize.value = 0.03 * alpha;
+    this.r.x = easeOutCubic(this.t);
+    this.r.y = 0.03 * alpha;
   }
   dispose(): void {
     this.mesh.removeFromParent();
@@ -307,19 +313,19 @@ export interface ManagedHint extends Hint {
   dispose(): void;
 }
 
+/**
+ * Asked every frame with the hint's rig-local target: true while something the player should read first (a
+ * caption bubble near it, from the eye's point of view) would sit under the ghost glove.
+ */
+export type HintBusy = (targetLocal: Vector3) => boolean;
+
 const PINCH_PERIOD = 2.8;
 const POKE_PERIOD = 2.4;
 const STOP_FADE = 0.25;
+const HOLD_FADE = 0.2; // the glove bows out this fast when a caption pops up near its target
+const SETTLE = 0.3; // a new glove waits this long before its first mime (a caption cued with it wins)
 
-const _w = new Vector3();
 const _a = new Vector3();
-const _b = new Vector3();
-const _off = new Vector3();
-const _m = new Matrix4();
-const _x = new Vector3();
-const _y = new Vector3();
-const _z = new Vector3();
-const _q = new Quaternion();
 
 export class GloveHint implements ManagedHint {
   dead = false;
@@ -327,37 +333,54 @@ export class GloveHint implements ManagedHint {
   private readonly mat: MeshMatcapMaterial;
   private readonly ripple: Ripple;
   private readonly sideSign: number;
-  private readonly orient = new Quaternion();
+  /** Current glove orientation, row-major 3×3 (the mesh matrix is written directly: no quaternion syncs). */
+  private readonly rot = new Float64Array(9);
+  /** Poke only: constant correction turning the (mirrored) index direction onto local −Z. */
+  private readonly rc = new Float64Array(9);
   private readonly target = new Vector3();
   private readonly dir = new Vector3();
   private readonly localAnchor = new Vector3(); // pinch point / fingertip in mirrored glove space
   private t = 0;
   private stopping = -1;
   private fired = false;
+  /** 1 = free to mime, 0 = parked behind a caption (the mime restarts from its approach when released) */
+  private holdK = 0;
+  private settle = SETTLE;
 
   constructor(
     private readonly ctx: UICtx,
-    private readonly shared: GloveShared,
+    shared: GloveShared,
     private readonly kind: 'pinch' | 'poke',
     private readonly targetObj: Object3D,
     side: Side,
     rippleGeo: PlaneGeometry,
+    private readonly busy: HintBusy | null = null,
   ) {
     this.sideSign = side === 'left' ? -1 : 1;
     this.mat = ghostMaterial(shared);
     this.mesh = new Mesh(shared.geometry, this.mat);
     this.mesh.name = `ui-hint-${kind}-${side}`;
     this.mesh.renderOrder = 40;
-    this.mesh.scale.set(this.sideSign, 1, 1); // mirror for the left hand (three flips the winding for us)
+    // the local matrix is written every frame (placeAt): rotation, the left-hand mirror on X (three flips the
+    // winding for a negative determinant) and the translation that puts the pinch point / fingertip on target
+    manualMatrix(this.mesh);
     this.mesh.morphTargetInfluences = [0, kind === 'poke' ? 1 : 0];
     this.mesh.visible = false;
     ctx.root.add(this.mesh);
     this.ripple = new Ripple(ctx.root, rippleGeo);
     const anchor = kind === 'pinch' ? shared.pinchPoint : shared.pokeTip;
     this.localAnchor.set(anchor.x * this.sideSign, anchor.y, anchor.z);
+    const m = new Matrix4();
     if (kind === 'pinch') {
       // reach in from the player's side: fingers forward + down, thumb side tipped up a little
-      this.orient.setFromEuler(new Euler(-30 * DEG, 18 * DEG * this.sideSign, -62 * DEG * this.sideSign, 'YXZ'));
+      const q = new Quaternion().setFromEuler(new Euler(-30 * DEG, 18 * DEG * this.sideSign, -62 * DEG * this.sideSign, 'YXZ'));
+      rot3From(m.makeRotationFromQuaternion(q), this.rot);
+    } else {
+      // the index does not lie exactly on local −Z (splay/curl): this turns it onto −Z
+      const pd = shared.pokeDir;
+      const q = new Quaternion().setFromUnitVectors(new Vector3(pd.x * this.sideSign, pd.y, pd.z).normalize(), new Vector3(0, 0, -1));
+      rot3From(m.makeRotationFromQuaternion(q), this.rc);
+      rot3From(m.identity(), this.rot);
     }
     this.t = 0;
   }
@@ -368,7 +391,6 @@ export class GloveHint implements ManagedHint {
 
   update(dt: number): void {
     if (this.dead) return;
-    this.t += dt;
     let fade = 1;
     if (this.stopping >= 0) {
       this.stopping += dt;
@@ -380,21 +402,44 @@ export class GloveHint implements ManagedHint {
         return;
       }
     }
-    this.targetObj.getWorldPosition(_w);
-    this.ctx.rig.toLocal(_w, this.target);
+    // the target's world matrix as the renderer left it (≤ 1 frame stale): no recomposition, no allocation
+    this.ctx.frame.objectLocal(this.targetObj, this.target);
     if (!Number.isFinite(this.target.x + this.target.y + this.target.z)) return;
+    // a caption near the target is read first: bow out, then mime from the start once it has gone
+    // (a stopping hint keeps its level: the stop fade takes it from there)
+    if (this.stopping < 0) {
+      if (this.settle > 0) this.settle -= dt;
+      const held = this.settle > 0 || (this.busy !== null && this.busy(this.target));
+      this.holdK = held ? Math.max(0, this.holdK - dt / HOLD_FADE) : Math.min(1, this.holdK + dt / HOLD_FADE);
+    }
+    if (this.holdK <= 0) {
+      this.t = 0;
+      this.fired = false;
+      this.mesh.visible = false;
+      this.ripple.update(dt, 1);
+      return;
+    }
+    this.t += dt;
     const alpha = this.kind === 'pinch' ? this.updatePinch() : this.updatePoke();
-    const a = alpha * fade;
+    const a = alpha * fade * this.holdK;
     this.mat.opacity = 0.72 * a;
     this.mesh.visible = a > 0.01;
     this.ripple.update(dt, 1);
   }
 
-  /** Place the glove so its local anchor lands on rig-local point `p`. */
+  /** Rig-local target of the mime (debug / tests). */
+  get targetLocal(): Vector3 {
+    return this.target;
+  }
+
+  /** 0 = parked behind a caption, 1 = miming freely (debug / tests). */
+  get holdLevel(): number {
+    return this.holdK;
+  }
+
+  /** Place the glove so its local anchor lands on rig-local point `p` (writes the mesh matrix: allocation-free). */
   private placeAt(p: Vector3): void {
-    this.mesh.quaternion.copy(this.orient);
-    _off.copy(this.localAnchor).applyQuaternion(this.orient);
-    this.mesh.position.copy(p).sub(_off);
+    setRotPose(this.mesh, this.rot, this.sideSign, this.localAnchor, p);
   }
 
   private updatePinch(): number {
@@ -404,29 +449,42 @@ export class GloveHint implements ManagedHint {
     // A: approach start (up, toward the player, to the hand's side); B: hover; C: contact; D: lifted
     let close = 0;
     let alpha = 1;
+    // offsets from the target (written into _a below: plain field writes, no calls with double arguments)
+    let ox = 0;
+    let oy = 0;
+    let oz = 0;
     if (u < 0.12) {
-      _a.set(T.x + 0.05 * s, T.y + 0.075, T.z + 0.09);
+      ox = 0.05 * s;
+      oy = 0.075;
+      oz = 0.09;
       alpha = smoothstep(0, 0.12, u);
     } else if (u < 0.42) {
       const k = easeInOutSine((u - 0.12) / 0.3);
-      _a.set(T.x + lerp(0.05 * s, 0, k), T.y + lerp(0.075, 0.012, k), T.z + lerp(0.09, 0, k));
+      ox = lerp(0.05 * s, 0, k);
+      oy = lerp(0.075, 0.012, k);
+      oz = lerp(0.09, 0, k);
     } else if (u < 0.56) {
       const k = easeInOutSine((u - 0.42) / 0.14);
       close = k;
-      _a.set(T.x, T.y + lerp(0.012, 0, k), T.z);
+      oy = lerp(0.012, 0, k);
     } else if (u < 0.72) {
       const k = easeInOutSine((u - 0.56) / 0.16);
       close = 1;
-      _a.set(T.x, T.y + 0.014 * k, T.z);
+      oy = 0.014 * k;
     } else if (u < 0.86) {
       close = 1;
-      _a.set(T.x, T.y + 0.014, T.z);
+      oy = 0.014;
     } else {
       const k = easeInOutSine((u - 0.86) / 0.14);
       close = 1 - k;
-      _a.set(T.x + 0.03 * s * k, T.y + 0.014 + 0.05 * k, T.z + 0.07 * k);
+      ox = 0.03 * s * k;
+      oy = 0.014 + 0.05 * k;
+      oz = 0.07 * k;
       alpha = 1 - k;
     }
+    _a.x = T.x + ox;
+    _a.y = T.y + oy;
+    _a.z = T.z + oz;
     if (u >= 0.56 && !this.fired) {
       this.fired = true;
       this.ripple.fire(T);
@@ -440,11 +498,24 @@ export class GloveHint implements ManagedHint {
     const u = (this.t % POKE_PERIOD) / POKE_PERIOD;
     const T = this.target;
     // poke direction: from a resting hand position on the player's side toward the target
-    _b.set(0.13 * this.sideSign, -0.2, -0.08);
-    this.dir.copy(T).sub(_b);
-    if (this.dir.lengthSq() < 1e-6) this.dir.set(0, 0, -1);
-    this.dir.normalize();
-    this.orientAlong(this.dir);
+    const d = this.dir;
+    let dx = T.x - 0.13 * this.sideSign;
+    let dy = T.y + 0.2;
+    let dz = T.z + 0.08;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-3) {
+      dx = 0;
+      dy = 0;
+      dz = -1;
+    } else {
+      dx /= len;
+      dy /= len;
+      dz /= len;
+    }
+    d.x = dx;
+    d.y = dy;
+    d.z = dz;
+    this.orientAlong();
     let dist: number;
     let alpha = 1;
     if (u < 0.12) {
@@ -463,25 +534,49 @@ export class GloveHint implements ManagedHint {
       this.fired = true;
       this.ripple.fire(T);
     } else if (u < 0.5) this.fired = false;
-    _a.copy(T).addScaledVector(this.dir, dist);
+    _a.x = T.x + d.x * dist;
+    _a.y = T.y + d.y * dist;
+    _a.z = T.z + d.z * dist;
     this.placeAt(_a);
     return alpha;
   }
 
-  /** Orientation whose (mirrored) index direction points along `d`, palm facing down. */
-  private orientAlong(d: Vector3): void {
-    _z.copy(d).negate();
-    _x.crossVectors(UP, _z);
-    if (_x.lengthSq() < 1e-6) _x.set(1, 0, 0);
-    _x.normalize();
-    _y.crossVectors(_z, _x);
-    _m.makeBasis(_x, _y, _z);
-    this.orient.setFromRotationMatrix(_m);
-    // correct for the index not lying exactly on local -Z (splay/curl)
-    const pd = this.shared.pokeDir;
-    _b.set(pd.x * this.sideSign, pd.y, pd.z);
-    _q.setFromUnitVectors(_b, _w.set(0, 0, -1));
-    this.orient.multiply(_q);
+  /**
+   * Orientation whose (mirrored) index direction points along the unit `dir`, palm facing down:
+   * rot = basis(x, y, z) · rc with z = −dir, x = up × z, y = z × x. Plain arithmetic (per frame).
+   */
+  private orientAlong(): void {
+    const d = this.dir;
+    const zx = -d.x;
+    const zy = -d.y;
+    const zz = -d.z;
+    // x = (0, 1, 0) × z
+    let xx = zz;
+    let xz = -zx;
+    const xl = Math.sqrt(xx * xx + xz * xz);
+    if (xl < 1e-3) {
+      xx = 1;
+      xz = 0;
+    } else {
+      xx /= xl;
+      xz /= xl;
+    }
+    // y = z × x  (x has no y component)
+    const yx = zy * xz;
+    const yy = zz * xx - zx * xz;
+    const yz = -zy * xx;
+    const c = this.rc;
+    const r = this.rot;
+    // basis matrix B = [x y z] (columns), row-major rows: (xx, yx, zx), (0, yy, zy), (xz, yz, zz)
+    r[0] = xx * c[0] + yx * c[3] + zx * c[6];
+    r[1] = xx * c[1] + yx * c[4] + zx * c[7];
+    r[2] = xx * c[2] + yx * c[5] + zx * c[8];
+    r[3] = yy * c[3] + zy * c[6];
+    r[4] = yy * c[4] + zy * c[7];
+    r[5] = yy * c[5] + zy * c[8];
+    r[6] = xz * c[0] + yz * c[3] + zz * c[6];
+    r[7] = xz * c[1] + yz * c[4] + zz * c[7];
+    r[8] = xz * c[2] + yz * c[5] + zz * c[8];
   }
 
   dispose(): void {
