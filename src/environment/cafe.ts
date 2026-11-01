@@ -101,7 +101,7 @@ export class CafeImpl implements Cafe {
     this.volunteerSpot.position.set(...L.volunteerSpot);
     this.volunteerSpot.rotation.y = Math.atan2(-L.volunteerSpot[0], -L.volunteerSpot[2]);
     this.posterWall.name = 'posterWall';
-    this.posterWall.position.set(0, L.posterWall.centerY, L.posterWall.z);
+    this.posterWall.position.set(L.posterWall.centerX, L.posterWall.centerY, L.posterWall.z);
     this.root.add(this.volunteerSpot, this.posterWall);
     L.plaques.forEach((p, i) => {
       const a = new Object3D();

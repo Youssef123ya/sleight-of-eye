@@ -472,20 +472,20 @@ export function makeDecorTexture(anisotropy: number): CanvasTexture {
     g.fillText(txt, x + 1.2, y + 0.8);
     g.globalAlpha = 1;
   };
-  chalk('Café', 256, 78, 74);
-  chalk('Minuit', 256, 150, 74);
+  chalk('Midnight', 256, 78, 70);
+  chalk('Café', 256, 150, 74);
   g.strokeStyle = 'rgba(244,240,228,0.6)';
   g.lineWidth = 3;
   g.beginPath();
   g.moveTo(120, 200);
   g.bezierCurveTo(200, 186, 312, 214, 392, 198);
   g.stroke();
-  chalk('~ ce soir ~', 256, 246, 34, 'rgba(255,214,140,0.9)');
-  chalk('MAGIE', 256, 300, 48, 'rgba(255,224,150,0.95)', false);
-  chalk('de près', 256, 346, 32, 'rgba(255,214,140,0.85)');
+  chalk('~ tonight ~', 256, 246, 34, 'rgba(255,214,140,0.9)');
+  chalk('MAGIC', 256, 300, 48, 'rgba(255,224,150,0.95)', false);
+  chalk('up close', 256, 346, 32, 'rgba(255,214,140,0.85)');
   const menu: Array<[string, string]> = [
-    ['chocolat chaud', '3'],
-    ['tarte tatin', '4'],
+    ['hot chocolate', '3'],
+    ['apple tart', '4'],
     ['croissant', '2'],
   ];
   menu.forEach(([item, price], i) => {
@@ -560,7 +560,7 @@ export function makeDecorTexture(anisotropy: number): CanvasTexture {
       g.fillText(t, cx + Math.cos(a) * 168, cy + Math.sin(a) * 168);
     });
     g.font = `italic 26px ${serif}`;
-    g.fillText('Minuit', cx, cy + 82);
+    g.fillText('Midnight', cx, cy + 82);
     // hands at 11:59 (almost midnight)
     const hand = (ang: number, len: number, w: number) => {
       g.save();
@@ -611,13 +611,13 @@ export function makeDecorTexture(anisotropy: number): CanvasTexture {
     g.lineWidth = 3;
     g.strokeRect(42, y0 + 42, 940, 300);
     g.fillStyle = '#e6be62';
-    g.font = `italic bold 150px ${serif}`;
+    g.font = `italic bold 128px ${serif}`;
     g.textAlign = 'center';
     g.textBaseline = 'middle';
-    g.fillText('Café Minuit', 512, y0 + 170);
+    g.fillText('Midnight Café', 512, y0 + 170, 900);
     g.font = `34px ${serif}`;
     g.fillStyle = '#d9b263';
-    g.fillText('— MAGIE & CHOCOLAT —', 512, y0 + 290);
+    g.fillText('— MAGIC & COCOA —', 512, y0 + 290);
   }
 
   const t = new CanvasTexture(c);

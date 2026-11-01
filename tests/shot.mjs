@@ -2,18 +2,20 @@
 // Uses the installed Google Chrome (playwright-core channel 'chrome'): no browser download.
 //
 //   node tests/shot.mjs [--url=http://127.0.0.1:8081/] [--out=tests/out/shot.png] [--w=1280] [--h=720]
-//                       [--xr] [--head=x,y,z] [--look=x,y,z] [--fov=60] [--wait=1500]
+//                       [--xr] [--head=x,y,z] [--look=x,y,z] [--fov=60] [--wait=1500] [--hmr]
 //                       [--scenario=tests/scenarios/foo.mjs]
 //
-// --xr       accept the emulated XR session, switch IWER to hands only, hide the DevUI overlay.
-// --head/--look  place the emulated headset (metres, local-floor: y up, -Z forward).
+// --xr       pre-place the emulated head, enter XR (the landing's Enter button when present, else IWER's offered
+//            session), switch IWER to hands only and hide the DevUI overlay (tests/lib/iwer.mjs enterXR).
+// --head/--look  emulated headset pose (metres, local-floor: y up, -Z forward); default eye 0,1.2,0.
+// --hmr      let Vite hot-reload the page (off by default so other people's edits never reload a capture).
 // --scenario a module whose default export `async (page, api) => result` runs after setup;
 //            `api` = { evaluate, shot(name), wait(ms), director(fn) } — see bottom of file.
 // Prints one JSON object: { out, errors, warnings, stats, scenario }. Exit code 1 on page errors.
-import { chromium } from 'playwright-core';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { enterXR, openApp } from './lib/iwer.mjs';
 
 const args = Object.fromEntries(
   process.argv.slice(2).map((a) => {
@@ -23,40 +25,18 @@ const args = Object.fromEntries(
 );
 const url = args.url ?? `http://127.0.0.1:${process.env.APP_PORT ?? 8081}/`;
 const out = path.resolve(args.out ?? 'tests/out/shot.png');
-const W = Number(args.w ?? 1280);
-const H = Number(args.h ?? 720);
 const vec = (s) => (typeof s === 'string' ? s.split(',').map(Number) : undefined);
 mkdirSync(path.dirname(out), { recursive: true });
 
-const browser = await chromium.launch({
-  channel: 'chrome',
-  headless: true,
-  args: ['--use-angle=d3d11', '--disable-background-timer-throttling', '--disable-renderer-backgrounding'],
-});
-const errors = [];
-const warnings = [];
+let app;
 let exitCode = 0;
 try {
-  const page = await (await browser.newContext({ viewport: { width: W, height: H }, deviceScaleFactor: 1 })).newPage();
-  page.on('pageerror', (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on('console', (m) => {
-    if (m.type() === 'error') errors.push(`[console] ${m.text()}`);
-    else if (m.type() === 'warning') warnings.push(m.text());
-  });
-  await page.goto(url, { waitUntil: 'load' });
-  await page.waitForFunction(() => !!window.FRAMEWORK_MCP_RUNTIME?.world, null, { timeout: 45000 });
+  app = await openApp(url, { w: Number(args.w ?? 1280), h: Number(args.h ?? 720), hmr: !!args.hmr });
+  const { page } = app;
 
   if (args.xr) {
-    await page.evaluate(
-      async ({ fov, head, look }) => {
-        const { DemoDirector } = await import('/capture/director.js');
-        const d = await DemoDirector.attach({ fovyDeg: fov });
-        window.__director = d;
-        if (head) d.place({ head, look: look ?? [head[0], head[1] - 0.3, head[2] - 1] });
-        await d.wait(0.5);
-      },
-      { fov: Number(args.fov ?? 60), head: vec(args.head), look: vec(args.look) },
-    );
+    const head = vec(args.head) ?? [0, 1.2, 0];
+    await enterXR(page, { fov: Number(args.fov ?? 60), head, look: vec(args.look) ?? [head[0], head[1] - 0.3, head[2] - 1] });
   }
 
   let scenario;
@@ -84,7 +64,7 @@ try {
     });
     return {
       fps: Math.round((frames * 1000) / (performance.now() - t0)),
-      drawCalls: info?.render?.calls,
+      drawCalls: info?.render?.calls, // IWER renders 2 views without multiview: per-view cost is about half
       triangles: info?.render?.triangles,
       programs: info?.programs?.length,
       geometries: info?.memory?.geometries,
@@ -94,12 +74,12 @@ try {
     };
   });
   await page.screenshot({ path: out });
-  if (errors.length) exitCode = 1;
-  console.log(JSON.stringify({ out, errors, warnings: warnings.slice(0, 20), stats, scenario }, null, 2));
+  if (app.errors.length) exitCode = 1;
+  console.log(JSON.stringify({ out, errors: app.errors, warnings: app.warnings.slice(0, 20), stats, scenario }, null, 2));
 } catch (e) {
   exitCode = 2;
-  console.log(JSON.stringify({ out, fatal: String(e?.stack ?? e), errors, warnings: warnings.slice(0, 20) }, null, 2));
+  console.log(JSON.stringify({ out, fatal: String(e?.stack ?? e), errors: app?.errors ?? [], warnings: (app?.warnings ?? []).slice(0, 20) }, null, 2));
 } finally {
-  await browser.close();
+  await app?.close?.();
   process.exit(exitCode);
 }

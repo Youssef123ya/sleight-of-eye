@@ -119,6 +119,8 @@ export interface Spectator {
   setEyeGlyph(state: 'open' | 'closed' | 'hidden'): void;
   /** Sight-cone wedge on the cloth in the spectator's colour; `alarm` flashes it red (the catcher). */
   setSightCone(visible: boolean, alarm?: boolean): void;
+  /** Width of the drawn cone (CFG.sightHalfAngle, or sightHalfAngleEasy in Easy Audience). */
+  setSightHalfAngle(deg: number): void;
   /** Visual state for eye contact (kit looks back warmly) / flustered (Brock blushes). */
   setMood(mood: 'neutral' | 'eyeContact' | 'flustered' | 'suspicious'): void;
   update(dt: number, time: number): void;
@@ -294,7 +296,8 @@ export interface UI {
   titleCard(title: string, subtitle?: string): Promise<void>;
   /** Brief rewind smear over the stage after a catch. */
   rewindSmear(): Promise<void>;
-  review(data: ReviewData): void;
+  /** Newspaper at the bow; null hides it (new show / Retry). */
+  review(data: ReviewData | null): void;
   posters(list: PosterData[]): void;
   /** "Hold it!" style banner (tracking loss, pause). */
   banner(text: string | null): void;
@@ -360,6 +363,11 @@ export interface GameContext {
 
 /** Test/debug hooks exposed as `window.__app` (implemented by game/debug.ts). */
 export interface DebugApi {
+  /**
+   * Snapshot for tests. Fields the scenarios rely on: act, beat, beatKind, caught (count), palmed (PropId|null),
+   * loaded (Record<PropId,PropId>), gazeTarget, watchers, calibrated, paused, stars (per act), revealTarget,
+   * settings, spectators [{id, rule, watchingMat}].
+   */
   debugState(): Record<string, unknown>;
   skipTo(act: number, beat?: number): void;
   setSettings(patch: Partial<Settings>): void;

@@ -79,7 +79,7 @@ export class Posters {
       this.group.position.set(0, 0, 0.006);
       wall.add(this.group);
     } else {
-      this.group.position.set(0, L.posterWall.centerY, L.posterWall.z + 0.01);
+      this.group.position.set(L.posterWall.centerX, L.posterWall.centerY, L.posterWall.z + 0.01);
       ctx.root.add(this.group);
     }
     const c = this.ct.ctx;

@@ -3,7 +3,7 @@ export const CFG = {
   // Gaze
   gazeMinCutoff: 1.5, // 1€ filter
   gazeBeta: 0.05,
-  gazeSlackDeg: 2.0, // extra angular radius when picking a gaze target
+  gazeSlackDeg: 1.5, // extra angular radius when picking a gaze target
   gadgetDwell: 0.6, // look at a gadget this long to fire it
   eyeContactFox: 0.6, // a kit looks back at your face
   eyeContactCritic: 1.0, // Brock gets flustered

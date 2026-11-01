@@ -18,7 +18,8 @@ export const L = {
     cupMid: [0, TABLE_Y + 0.006, -0.42] as V3,
     cupRight: [0.095, TABLE_Y + 0.006, -0.42] as V3,
     watch: [0, TABLE_Y + 0.006, -0.39] as V3,
-    cupcake: [0.12, TABLE_Y + 0.006, -0.35] as V3,
+    // front-left of the mat: clear of the cup circles, easy to reach blind, inside the glasses frustum on any glance
+    cupcake: [-0.06, TABLE_Y + 0.006, -0.335] as V3,
   },
   volunteerSpot: [0.1, TABLE_Y + 0.004, -0.33] as V3, // a kit hops here for the ear reveal
   riser: { z: -0.66, topY: TABLE_Y + 0.04, width: 0.5, depth: 0.12 },
@@ -30,18 +31,19 @@ export const L = {
     [0.09, TABLE_Y + 0.04, -0.66],
     [0.18, TABLE_Y + 0.04, -0.66],
   ] as V3[],
-  shelf: { z: -0.84, topY: TABLE_Y + 0.12 },
-  // Gadget bases (focus points sit a few cm above). ≈ ±24° yaw, ≈ -7° pitch: ≥10° from any spectator head.
+  shelf: { z: -0.84, topY: TABLE_Y + 0.2 },
+  // Gadget bases (focus points sit a few cm above). ≈ ±20° yaw keeps every mat prop inside the Meta VR Glasses
+  // frustum on a glance (tests/fov.mjs); a high shelf (≈ -4° pitch) keeps them ≈ 9° from the nearest spectator head.
   gadgets: {
-    musicBox: [-0.36, TABLE_Y + 0.12, -0.82] as V3,
-    firework: [0, TABLE_Y + 0.17, -0.92] as V3, // launcher stands taller so its fuse clears the heads (≈ -4°)
-    candle: [0.36, TABLE_Y + 0.12, -0.82] as V3,
+    musicBox: [-0.3, TABLE_Y + 0.2, -0.84] as V3,
+    firework: [0, TABLE_Y + 0.25, -0.92] as V3, // launcher stands taller so its fuse clears the heads (≈ -1°)
+    candle: [0.3, TABLE_Y + 0.2, -0.84] as V3,
   },
   // Compact stage (limited neck movement): gadgets come in and up instead of out.
   gadgetsCompact: {
-    musicBox: [-0.27, TABLE_Y + 0.22, -0.84] as V3,
-    firework: [0, TABLE_Y + 0.24, -0.94] as V3,
-    candle: [0.27, TABLE_Y + 0.22, -0.84] as V3,
+    musicBox: [-0.24, TABLE_Y + 0.28, -0.86] as V3,
+    firework: [0, TABLE_Y + 0.31, -0.94] as V3,
+    candle: [0.24, TABLE_Y + 0.28, -0.86] as V3,
   },
   burst: [0, 0.12, -0.95] as V3, // firework burst ≈ +7°
   plaques: [
@@ -51,7 +53,7 @@ export const L = {
     [0.25, TABLE_Y + 0.012, -0.2],
   ] as V3[], // tilted ~35° toward the player
   lamp: [0, 0.42, -0.52] as V3,
-  posterWall: { z: -1.6, centerY: 0.12, width: 1.8, height: 0.9 },
+  posterWall: { z: -1.6, centerX: -0.35, centerY: 0.12, width: 1.0, height: 0.9 }, // left of the window
   window: { center: [0.75, 0.25, -1.45] as V3, size: [0.8, 0.9] as const },
 } as const;
 
