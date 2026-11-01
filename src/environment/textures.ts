@@ -2,6 +2,7 @@
 // the wallpaper, the décor atlas (chalkboard, clock, labels) and the pocket-watch dial. Built once at startup.
 import { CanvasTexture, LinearMipmapLinearFilter, NoColorSpace, RepeatWrapping, SRGBColorSpace } from '@iwsdk/core';
 import { L } from '../layout.js';
+import { FONT_DISPLAY } from '../ui/fonts.js';
 import { rng } from './util.js';
 
 function canvas2d(w: number, h: number): [HTMLCanvasElement, CanvasRenderingContext2D] {
@@ -448,7 +449,7 @@ export function makeDecorTexture(anisotropy: number): CanvasTexture {
   const rand = rng(11);
   g.fillStyle = '#ffffff';
   g.fillRect(0, 0, N, N);
-  const serif = 'Georgia, "Times New Roman", "Noto Serif", serif';
+  const serif = FONT_DISPLAY; // self-hosted Playfair Display (ensureFonts runs before the café is built)
 
   // --- chalkboard (0,0)-(512,640)
   g.fillStyle = '#1b2420';
@@ -634,7 +635,7 @@ export function makeDialTexture(): CanvasTexture {
   const [c, g] = canvas2d(N, N);
   const cx = N / 2;
   const cy = N / 2;
-  const serif = 'Georgia, "Times New Roman", serif';
+  const serif = FONT_DISPLAY;
   const grd = g.createRadialGradient(cx - 30, cy - 40, 10, cx, cy, 128);
   grd.addColorStop(0, '#fffaf0');
   grd.addColorStop(1, '#eadfc6');

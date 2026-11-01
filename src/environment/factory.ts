@@ -15,10 +15,12 @@
 //   (default CFG.bangLookDuration, Infinity allowed). activate() is ignored while used/unavailable/active.
 // - Plaque anchors ('plaqueAnchor-0..3') face the eye: +Z toward the player, +Y up the plaque face.
 import type { EnvironmentFactory } from '../contracts.js';
+import { ensureFonts } from '../ui/fonts.js';
 import { CafeImpl } from './cafe.js';
 
 export const environmentFactory: EnvironmentFactory = {
   async build(world, rig) {
+    await ensureFonts(); // the chalkboard, sign and clock face are painted once, so the fonts must be ready first
     const cafe = new CafeImpl(world, rig);
     return { cafe, fx: cafe.fx };
   },

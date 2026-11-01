@@ -1,7 +1,6 @@
-// UI type: font stacks shared by the 2D landing page (CSS vars in index.html) and every canvas texture in XR.
-// No font files ship yet: these are system stacks (Quest Browser resolves them to Noto Serif / Roboto). To
-// self-host OFL fonts later, drop the files in public/fonts/ and list them in SELF_HOSTED below. The family
-// names below already put "Playfair Display" / "Nunito" first, so canvases and CSS pick them up automatically.
+// UI type: font stacks shared by the 2D landing page (CSS vars + @font-face in index.html) and every canvas texture
+// in XR. Playfair Display and Nunito are self-hosted OFL variable fonts in public/fonts/ (licences alongside);
+// the system stacks behind them are only fallbacks if a file fails to load.
 
 /** Elegant display serif: titles, mastheads, posters, title cards. */
 export const FONT_DISPLAY =
@@ -17,12 +16,12 @@ interface SelfHostedFont {
   descriptors?: FontFaceDescriptors;
 }
 
-/**
- * Self-hosted fonts, loaded with FontFace before any canvas text is drawn. Empty on purpose: list a file here
- * only once it exists, e.g. { family: 'Playfair Display', file: 'PlayfairDisplay[wght].ttf',
- * descriptors: { weight: '400 900' } } — a missing file would log a 404.
- */
-const SELF_HOSTED: SelfHostedFont[] = [];
+/** Self-hosted fonts (google/fonts, SIL OFL 1.1), loaded with FontFace before any canvas text is drawn. */
+const SELF_HOSTED: SelfHostedFont[] = [
+  { family: 'Playfair Display', file: 'PlayfairDisplay-Variable.ttf', descriptors: { weight: '400 900' } },
+  { family: 'Playfair Display', file: 'PlayfairDisplay-Italic-Variable.ttf', descriptors: { weight: '400 900', style: 'italic' } },
+  { family: 'Nunito', file: 'Nunito-Variable.ttf', descriptors: { weight: '200 1000' } },
+];
 
 let ready: Promise<void> | null = null;
 

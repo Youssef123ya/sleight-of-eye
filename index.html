@@ -14,6 +14,8 @@
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230b1030'/%3E%3Cpath d='M8 32 Q32 8 56 32 Q32 56 8 32Z' fill='%23fff4dc'/%3E%3Ccircle cx='32' cy='32' r='11' fill='%23c99a3c'/%3E%3Ccircle cx='32' cy='32' r='5' fill='%23241a12'/%3E%3Ccircle cx='29' cy='29' r='2' fill='%23fff'/%3E%3C/svg%3E"
     />
     <title>Sleight of Eye</title>
+    <link rel="preload" href="./fonts/PlayfairDisplay-Variable.ttf" as="font" type="font/ttf" crossorigin />
+    <link rel="preload" href="./fonts/Nunito-Variable.ttf" as="font" type="font/ttf" crossorigin />
     <script>
       // Module demos (?demo=…) render without the landing page unless they ask for it.
       (function () {
@@ -25,6 +27,26 @@
       })();
     </script>
     <style>
+      /* Self-hosted OFL fonts (public/fonts, licences alongside) */
+      @font-face {
+        font-family: 'Playfair Display';
+        src: url('./fonts/PlayfairDisplay-Variable.ttf') format('truetype');
+        font-weight: 400 900;
+        font-display: swap;
+      }
+      @font-face {
+        font-family: 'Playfair Display';
+        src: url('./fonts/PlayfairDisplay-Italic-Variable.ttf') format('truetype');
+        font-weight: 400 900;
+        font-style: italic;
+        font-display: swap;
+      }
+      @font-face {
+        font-family: 'Nunito';
+        src: url('./fonts/Nunito-Variable.ttf') format('truetype');
+        font-weight: 200 1000;
+        font-display: swap;
+      }
       :root {
         --night: #0b1030;
         --night-2: #1c2452;
